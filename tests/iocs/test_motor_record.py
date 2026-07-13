@@ -73,6 +73,41 @@ def test_stop_mid_move(motor_ioc):
     assert abs(rbv.read().data[0] - final) < 0.5  # and stayed put
 
 
+def test_driver_exception_recovers(motor_ioc):
+    """An unexpected moveTo exception must not kill the polling loop:
+    DMOV returns to 1 and a subsequent valid move still works."""
+    h, ctx, drv = motor_ioc
+    val, rbv, dmov = ctx.get_pvs("TEST:M1", "TEST:M1.RBV", "TEST:M1.DMOV")
+
+    original_move_to = drv.moveTo
+    fail_next = {"armed": True}
+
+    def flaky_move_to(pos):
+        if fail_next["armed"]:
+            fail_next["armed"] = False
+            raise RuntimeError("driver blew up")
+        return original_move_to(pos)
+
+    drv.moveTo = flaky_move_to
+
+    val.write(5.0, wait=True, timeout=15)  # this move raises in the driver
+    deadline = time.time() + 5
+    while time.time() < deadline and dmov.read().data[0] != 1:
+        time.sleep(0.05)
+    assert dmov.read().data[0] == 1  # loop recovered, not frozen
+
+    # A subsequent valid move must still work end-to-end.
+    val.write(7.0, wait=True, timeout=15)
+    deadline = time.time() + 5
+    while time.time() < deadline and (
+            dmov.read().data[0] != 1
+            or abs(rbv.read().data[0] - 7.0) > 1e-6):
+        time.sleep(0.05)
+    assert dmov.read().data[0] == 1
+    assert abs(rbv.read().data[0] - 7.0) < 1e-6
+    assert abs(drv.getPos() - 7.0) < 1e-6
+
+
 def test_egu_and_velo(motor_ioc):
     h, ctx, drv = motor_ioc
     egu, velo = ctx.get_pvs("TEST:M1.EGU", "TEST:M1.VELO")

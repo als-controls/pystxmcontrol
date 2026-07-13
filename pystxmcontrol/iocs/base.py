@@ -129,7 +129,13 @@ class MotorRecordGroup(PVGroup):
                         await loop.run_in_executor(None, self._driver.stop)
                     await fields.stop.write(0)
                 await async_lib.library.sleep(self._moving_poll)
-            move_future.result()  # re-raise unexpected (non-limit) errors
+            try:
+                move_future.result()
+            except Exception as exc:
+                # An unexpected driver error must not kill this loop --
+                # otherwise RBV/DMOV freeze forever. Log and recover.
+                print(f"{self.prefix}: move to {target} failed: {exc!r}",
+                      flush=True)
             await refresh_rbv()
             await fields.motor_is_moving.write(0)
             await fields.done_moving_to_value.write(1)
