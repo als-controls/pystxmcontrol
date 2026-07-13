@@ -6,7 +6,6 @@ Usage (spawned by the supervisor, or standalone):
 from __future__ import annotations
 
 import argparse
-import json
 
 from pystxmcontrol.iocs import require_caproto
 
@@ -22,10 +21,14 @@ from pystxmcontrol.iocs.config import read_slice  # noqa: E402
 def build_pvdb_from_slice(s: dict) -> dict:
     assert s["kind"] == "controller", s["kind"]
     # Adapt slice format to build_controller API: controller_cls -> controller,
-    # controller_id -> address (for hardware controllers), filter non-config keys
+    # controller_id -> address (for hardware controllers). Everything else in
+    # the dict (besides controller/simulation/motors) is passed straight
+    # through as constructor kwargs by build_controller, so include port and
+    # exclude slice bookkeeping keys (kind/station/label/derived/motor_pv).
     controller_dict = {
         "controller": s["controller_cls"],
         "address": s["controller_id"],
+        "port": s["port"],
         "simulation": s["simulation"],
     }
     controller = build_controller(controller_dict)
