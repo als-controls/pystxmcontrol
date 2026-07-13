@@ -1,0 +1,141 @@
+"""Driver-backed caproto motor record + driver construction helpers."""
+from __future__ import annotations
+
+import asyncio
+
+from caproto.server import PVGroup, pvproperty
+
+from pystxmcontrol.controller.motor import SoftwareLimitError
+
+
+def build_controller(slice_or_group: dict):
+    """Instantiate + initialize a controller class by name from pystxmcontrol.drivers.
+
+    ``slice_or_group`` is expected to carry at least a ``controller`` key naming
+    the class in ``pystxmcontrol.drivers``, plus whatever kwargs that class's
+    constructor needs (address/port/etc). ``simulation`` (default True) is
+    passed through to ``initialize``.
+    """
+    import pystxmcontrol.drivers as drv
+
+    cls_name = slice_or_group["controller"]
+    cls = getattr(drv, cls_name)
+    kwargs = {k: v for k, v in slice_or_group.items()
+              if k not in ("controller", "simulation", "motors")}
+    ctrl = cls(**kwargs)
+    ctrl.initialize(simulation=slice_or_group.get("simulation", True))
+    return ctrl
+
+
+def build_motor(driver_cls_name: str, controller, entry: dict, axis):
+    """David's motor wiring (controller.py initialize), without eval."""
+    import pystxmcontrol.drivers as drv
+    m = getattr(drv, driver_cls_name)()
+    m.controller = controller
+    setattr(m, "config", entry)
+    m.connect(axis=axis)
+    m.offset = entry.get("offset", 0)
+    m.units = entry.get("units", 1)
+    return m
+
+
+class MotorRecordGroup(PVGroup):
+    """caproto record='motor' facade over a pystxmcontrol motor driver.
+
+    .VAL put -> IOC-side HLM/LLM limit check -> blocking driver.moveTo in a
+    worker thread; .RBV polled from driver.getPos() (idle_poll s idle,
+    moving_poll s while moving); .STOP put stops the pending move;
+    .VELO put calls driver.setAxisParams(velocity=...) when available.
+
+    Note: field putters (``@motor.fields.stop.putter`` etc) are NOT used here
+    -- caproto 1.3's fake_motor_record.py example itself drives STOP by
+    polling ``fields.stop.value`` inside the simulator loop rather than
+    attaching a putter, and ``instance.group`` parent navigation isn't a
+    documented/stable path in caproto.server.records.base. We follow the same
+    poll-based pattern for both STOP and VELO to sidestep that fragility.
+    """
+
+    motor = pvproperty(value=0.0, name="", record="motor", precision=3)
+
+    def __init__(self, prefix, *, driver, motor_config,
+                 idle_poll=0.1, moving_poll=0.02, **kwargs):
+        super().__init__(prefix, **kwargs)
+        self._driver = driver
+        self._motor_config = motor_config
+        self._idle_poll = idle_poll
+        self._moving_poll = moving_poll
+        self._move_queue: asyncio.Queue = asyncio.Queue()
+
+    @motor.startup
+    async def motor(self, instance, async_lib):
+        fields = instance.field_inst
+        cfg = self._motor_config
+
+        await fields.user_low_limit.write(float(cfg.get("minValue", -1e12)))
+        await fields.user_high_limit.write(float(cfg.get("maxValue", 1e12)))
+        await fields.velocity.write(float(cfg.get("max velocity", 0.0)))
+        await fields.engineering_units.write(
+            cfg.get("epics", {}).get("egu", "um"))
+        await fields.done_moving_to_value.write(1)
+        await fields.motor_is_moving.write(0)
+        await fields.stop.write(0)
+
+        last_velocity = fields.velocity.value
+
+        async def value_write_hook(fields_, value):
+            lo = fields.user_low_limit.value
+            hi = fields.user_high_limit.value
+            if not (lo <= value <= hi):
+                raise ValueError(
+                    f"{self.prefix}: {value} outside limits [{lo}, {hi}]")
+            self._move_queue.put_nowait(value)
+
+        fields.value_write_hook = value_write_hook
+
+        loop = asyncio.get_running_loop()
+
+        async def sync_velocity():
+            nonlocal last_velocity
+            current = fields.velocity.value
+            if current != last_velocity:
+                last_velocity = current
+                if hasattr(self._driver, "setAxisParams"):
+                    await loop.run_in_executor(
+                        None, lambda: self._driver.setAxisParams(velocity=current))
+
+        async def refresh_rbv():
+            pos = await loop.run_in_executor(None, self._driver.getPos)
+            await fields.user_readback_value.write(pos)
+
+        await refresh_rbv()
+
+        while True:
+            await sync_velocity()
+            try:
+                target = await asyncio.wait_for(
+                    self._move_queue.get(), timeout=self._idle_poll)
+            except asyncio.TimeoutError:
+                await refresh_rbv()
+                continue
+
+            await fields.done_moving_to_value.write(0)
+            await fields.motor_is_moving.write(1)
+            move_future = loop.run_in_executor(
+                None, self._guarded_move_to, target)
+            while not move_future.done():
+                await refresh_rbv()
+                if fields.stop.value:
+                    if hasattr(self._driver, "stop"):
+                        await loop.run_in_executor(None, self._driver.stop)
+                    await fields.stop.write(0)
+                await async_lib.library.sleep(self._moving_poll)
+            move_future.result()  # re-raise unexpected (non-limit) errors
+            await refresh_rbv()
+            await fields.motor_is_moving.write(0)
+            await fields.done_moving_to_value.write(1)
+
+    def _guarded_move_to(self, target):
+        try:
+            self._driver.moveTo(target)
+        except SoftwareLimitError:
+            pass  # belt-and-braces; the write hook's HLM/LLM check runs first
