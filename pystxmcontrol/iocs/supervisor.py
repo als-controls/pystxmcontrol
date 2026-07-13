@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
+import socket
 import subprocess
 import sys
 import tempfile
@@ -70,11 +72,31 @@ def plan_fleet(fleet: FleetConfig, slice_dir: str,
     return plans
 
 
+def _free_udp_port() -> int:
+    """Find a free UDP port on 127.0.0.1.
+
+    Copied (not imported) from tests/iocs/conftest.py: supervisor.py must not
+    depend on the test tree.
+    """
+    for _ in range(50):
+        port = random.randint(40000, 60000)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("no free port found")
+
+
 class Supervisor:
     def __init__(self, plans: list[IocPlan],
                  restart_backoff=(1, 2, 4, 8, 16, 30),
                  status_prefix: str | None = None,
-                 status_interval: float = 0.0):
+                 status_interval: float = 0.0,
+                 shared_ca_port: bool = False,
+                 ca_host: str = "127.0.0.1",
+                 slice_dir: str | None = None):
         self._plans = plans
         self._backoff = restart_backoff
         self._status_prefix = status_prefix
@@ -85,6 +107,29 @@ class Supervisor:
         self._threads: list[threading.Thread] = []
         self._status_loop: asyncio.AbstractEventLoop | None = None
         self._status_channels: dict[str, tuple] = {}
+        self._shared_ca_port = shared_ca_port
+        self._ca_host = ca_host
+        self._slice_dir = slice_dir
+        # Per-IOC CA server ports + the accumulated address list, allocated
+        # once so a crashed IOC restarts on the SAME port (clients reconnect
+        # instead of racing a new one). Empty/unused when shared_ca_port=True.
+        self._ports: dict[str, int] = {}
+        self._addr_list: str = ""
+
+    def _allocate_ports(self):
+        if self._shared_ca_port:
+            return
+        for p in self._plans:
+            self._ports[p.name] = _free_udp_port()
+        self._addr_list = " ".join(
+            f"{self._ca_host}:{self._ports[p.name]}" for p in self._plans)
+        print(f"[stxm-iocs] EPICS_CA_ADDR_LIST={self._addr_list}")
+        print("[stxm-iocs] (status server itself stays on the default CA port "
+              "-- caget STXM<station>:SUP:... needs no special addr list)")
+        if self._slice_dir:
+            addr_file = Path(self._slice_dir) / "EPICS_CA_ADDR_LIST.txt"
+            addr_file.write_text(self._addr_list + "\n")
+            print(f"[stxm-iocs] addr list written to {addr_file}")
 
     # -- process control ---------------------------------------------------
     def _spawn(self, plan: IocPlan) -> subprocess.Popen:
@@ -95,6 +140,18 @@ class Supervisor:
                    "--slice", plan.slice_path, "--quiet"]
         env = dict(os.environ)
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
+        if not self._shared_ca_port and plan.name in self._ports:
+            # NOTE: this caproto version's server binds using
+            # EPICS_CA_SERVER_PORT (see caproto/server/common.py Context.__init__
+            # -- "the default tcp/udp port from the environment"), NOT
+            # EPICS_CAS_SERVER_PORT despite the latter existing as a distinct
+            # env var name. Set both: CAS_SERVER_PORT for spec-correctness /
+            # forward-compat, CA_SERVER_PORT because that's what this caproto
+            # actually reads.
+            env["EPICS_CAS_SERVER_PORT"] = str(self._ports[plan.name])
+            env["EPICS_CA_SERVER_PORT"] = str(self._ports[plan.name])
+            env["EPICS_CA_ADDR_LIST"] = self._addr_list
+            env["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
         return subprocess.Popen(cmd, env=env)
 
     def _monitor(self, plan: IocPlan):
@@ -130,6 +187,7 @@ class Supervisor:
                 return
 
     def start(self):
+        self._allocate_ports()
         if self._status_prefix:
             self._start_status_server()
         for plan in self._plans:
@@ -243,6 +301,15 @@ def main(argv=None):
     parser.add_argument("--no-shutter-iocs", action="store_true")
     parser.add_argument("--status-interval", type=float, default=10.0)
     parser.add_argument("--startup-delay", type=float, default=3.0)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="host used in per-IOC EPICS_CA_ADDR_LIST entries")
+    parser.add_argument("--shared-ca-port", action="store_true",
+                        help="disable per-IOC CA server ports and use the "
+                             "default port 5064 for every IOC (prior "
+                             "behavior). Only safe on hosts where UDP "
+                             "broadcast search reaches every subprocess "
+                             "(e.g. most Linux hosts); on Windows only one "
+                             "process ever receives the search datagrams.")
     args = parser.parse_args(argv)
 
     slice_dir = args.slice_dir or tempfile.mkdtemp(prefix="stxm_iocs_")
@@ -253,7 +320,9 @@ def main(argv=None):
                        startup_delay=args.startup_delay)
     print(f"[stxm-iocs] station STXM{args.station}: {len(plans)} IOCs")
     sup = Supervisor(plans, status_prefix=f"STXM{args.station}:SUP",
-                     status_interval=args.status_interval)
+                     status_interval=args.status_interval,
+                     shared_ca_port=args.shared_ca_port,
+                     ca_host=args.host, slice_dir=slice_dir)
     sup.start()
     try:
         while True:

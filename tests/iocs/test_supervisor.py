@@ -95,6 +95,91 @@ def test_supervisor_status_pvs(tmp_path, free_port):
         sup.stop()
 
 
+def test_supervisor_per_ioc_ports_env(tmp_path):
+    """Each spawned IOC gets a distinct EPICS_CAS_SERVER_PORT and the full
+    accumulated EPICS_CA_ADDR_LIST across all plans (Windows UDP-broadcast
+    fix: without this, only one subprocess bound to 5064 ever receives
+    searches)."""
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+
+    plans = [IocPlan(name="a", module=None, slice_path="a.py"),
+             IocPlan(name="b", module=None, slice_path="b.py")]
+    sup = Supervisor(plans, status_prefix=None, slice_dir=str(tmp_path))
+    sup._allocate_ports()
+
+    assert set(sup._ports) == {"a", "b"}
+    assert sup._ports["a"] != sup._ports["b"]
+
+    # Build the env the same way _spawn does, without actually launching a
+    # process (IocPlan.slice_path here isn't a real script).
+    import os as _os
+    envs = {}
+    for name, port in sup._ports.items():
+        plan = next(p for p in plans if p.name == name)
+        e = dict(_os.environ)
+        e["EPICS_CAS_SERVER_PORT"] = str(sup._ports[plan.name])
+        e["EPICS_CA_SERVER_PORT"] = str(sup._ports[plan.name])
+        e["EPICS_CA_ADDR_LIST"] = sup._addr_list
+        e["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
+        envs[name] = e
+
+    assert envs["a"]["EPICS_CAS_SERVER_PORT"] != envs["b"]["EPICS_CAS_SERVER_PORT"]
+    assert envs["a"]["EPICS_CA_SERVER_PORT"] == envs["a"]["EPICS_CAS_SERVER_PORT"]
+    for name in ("a", "b"):
+        assert envs[name]["EPICS_CA_AUTO_ADDR_LIST"] == "NO"
+        addr_list = envs[name]["EPICS_CA_ADDR_LIST"]
+        assert f"127.0.0.1:{sup._ports['a']}" in addr_list
+        assert f"127.0.0.1:{sup._ports['b']}" in addr_list
+
+    addr_file = tmp_path / "EPICS_CA_ADDR_LIST.txt"
+    assert addr_file.exists()
+    assert addr_file.read_text().strip() == sup._addr_list
+
+
+def test_supervisor_spawn_sets_per_ioc_env(tmp_path, monkeypatch):
+    """Directly exercise Supervisor._spawn (the real code path, not a
+    reimplementation) by capturing the env passed to subprocess.Popen."""
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+    import pystxmcontrol.iocs.supervisor as supervisor_mod
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, cmd, env=None):
+            captured[cmd[-1]] = env
+
+    monkeypatch.setattr(supervisor_mod.subprocess, "Popen", FakePopen)
+
+    fake_a = tmp_path / "a.py"
+    fake_a.write_text("")
+    fake_b = tmp_path / "b.py"
+    fake_b.write_text("")
+    plans = [IocPlan(name="a", module=None, slice_path=str(fake_a)),
+             IocPlan(name="b", module=None, slice_path=str(fake_b))]
+    sup = Supervisor(plans, status_prefix=None, slice_dir=str(tmp_path))
+    sup._allocate_ports()
+    sup._spawn(plans[0])
+    sup._spawn(plans[1])
+
+    env_a = captured[str(fake_a)]
+    env_b = captured[str(fake_b)]
+    assert env_a["EPICS_CAS_SERVER_PORT"] != env_b["EPICS_CAS_SERVER_PORT"]
+    assert env_a["EPICS_CA_SERVER_PORT"] == env_a["EPICS_CAS_SERVER_PORT"]
+    assert env_b["EPICS_CA_SERVER_PORT"] == env_b["EPICS_CAS_SERVER_PORT"]
+    assert env_a["EPICS_CA_ADDR_LIST"] == env_b["EPICS_CA_ADDR_LIST"] == sup._addr_list
+    assert env_a["EPICS_CA_AUTO_ADDR_LIST"] == "NO"
+
+
+def test_supervisor_shared_ca_port_escape_hatch(tmp_path):
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+    plans = [IocPlan(name="a", module=None, slice_path="a.py")]
+    sup = Supervisor(plans, status_prefix=None, shared_ca_port=True,
+                     slice_dir=str(tmp_path))
+    sup._allocate_ports()
+    assert sup._ports == {}
+    assert not (tmp_path / "EPICS_CA_ADDR_LIST.txt").exists()
+
+
 def test_console_script_declared():
     import tomllib
     py = tomllib.loads((REPO / "pyproject.toml").read_text())
