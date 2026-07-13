@@ -32,6 +32,25 @@ def test_move_and_readback(motor_ioc):
     assert abs(drv.getPos() - 5.0) < 1e-6
 
 
+def test_val_put_completion_blocks_until_move_done(motor_ioc):
+    """A wait=True .VAL put must not return until the physical move is done
+    (DMOV=1) -- true motor-record busy semantics. The slow sim motor takes
+    move_duration=0.5 s per move, so the put must take at least that long,
+    and DMOV/RBV must already be final the instant it returns."""
+    h, ctx, drv = motor_ioc
+    val, rbv, dmov = ctx.get_pvs("TEST:M1", "TEST:M1.RBV", "TEST:M1.DMOV")
+    t0 = time.monotonic()
+    val.write(6.0, wait=True, timeout=15)
+    elapsed = time.monotonic() - t0
+    assert elapsed >= drv.move_duration, (
+        f"put-completion returned after {elapsed:.3f}s, before the "
+        f"{drv.move_duration}s move finished")
+    # No settling loop: completion means the move is already over.
+    assert dmov.read().data[0] == 1
+    assert abs(rbv.read().data[0] - 6.0) < 1e-6
+    assert abs(drv.getPos() - 6.0) < 1e-6
+
+
 def test_dmov_transitions_during_move(motor_ioc):
     h, ctx, drv = motor_ioc
     val, dmov, movn = ctx.get_pvs("TEST:M1", "TEST:M1.DMOV", "TEST:M1.MOVN")

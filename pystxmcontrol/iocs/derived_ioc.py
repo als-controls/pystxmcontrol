@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import threading
-import time
 
 from pystxmcontrol.iocs import require_caproto
 
@@ -108,18 +107,12 @@ class CAMotorProxy:
         self.moving = False
 
     def moveTo(self, pos, **kwargs):
-        # VAL put-completion (wait=True) only confirms MotorRecordGroup's
-        # value_write_hook accepted and queued the target -- the actual
-        # motion runs afterwards in the IOC's background loop. Poll MOVN
-        # until the move genuinely finishes so callers (derivedPiezo etc)
-        # can treat moveTo as synchronous, matching David's other motor
-        # drivers' moveTo semantics.
+        # MotorRecordGroup holds .VAL put-completion until the physical move
+        # finishes (DMOV=1), so wait=True alone gives synchronous moveTo
+        # semantics matching David's other motor drivers. One RBV read
+        # afterwards refreshes the cached position for callers.
         self._pvs["val"].write(float(pos), wait=True, timeout=120)
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            if not self.getStatus():
-                break
-            time.sleep(0.02)
+        self.getPos()
 
     def moveBy(self, step, **kwargs):
         self.moveTo(self.getPos() + step)

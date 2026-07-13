@@ -43,9 +43,11 @@ class MotorRecordGroup(PVGroup):
     """caproto record='motor' facade over a pystxmcontrol motor driver.
 
     .VAL put -> IOC-side HLM/LLM limit check -> blocking driver.moveTo in a
-    worker thread; .RBV polled from driver.getPos() (idle_poll s idle,
-    moving_poll s while moving); .STOP put stops the pending move;
-    .VELO put calls driver.setAxisParams(velocity=...) when available.
+    worker thread; the .VAL put-completion is held until the move finishes
+    (true motor-record busy semantics: caput -c returns when DMOV=1).
+    .RBV polled from driver.getPos() (idle_poll s idle, moving_poll s while
+    moving); .STOP put stops the pending move; .VELO put calls
+    driver.setAxisParams(velocity=...) when available.
 
     Note: field putters (``@motor.fields.stop.putter`` etc) are NOT used here
     -- caproto 1.3's fake_motor_record.py example itself drives STOP by
@@ -88,7 +90,16 @@ class MotorRecordGroup(PVGroup):
             if not (lo <= value <= hi):
                 raise ValueError(
                     f"{self.prefix}: {value} outside limits [{lo}, {hi}]")
-            self._move_queue.put_nowait(value)
+            # Block the .VAL put until the physical move actually finishes,
+            # so CA put-completion (caput -c / write(..., wait=True)) carries
+            # true motor-record busy semantics for every client. caproto
+            # spawns each write handler as its own task
+            # (VirtualCircuit._start_write_task -> tasks.create), so awaiting
+            # here does NOT stall the circuit: STOP puts and RBV/MOVN reads
+            # keep flowing while this put is pending.
+            done_event = asyncio.Event()
+            self._move_queue.put_nowait((value, done_event))
+            await done_event.wait()
 
         fields.value_write_hook = value_write_hook
 
@@ -112,33 +123,40 @@ class MotorRecordGroup(PVGroup):
         while True:
             await sync_velocity()
             try:
-                target = await asyncio.wait_for(
+                target, done_event = await asyncio.wait_for(
                     self._move_queue.get(), timeout=self._idle_poll)
             except asyncio.TimeoutError:
                 await refresh_rbv()
                 continue
 
-            await fields.done_moving_to_value.write(0)
-            await fields.motor_is_moving.write(1)
-            move_future = loop.run_in_executor(
-                None, self._guarded_move_to, target)
-            while not move_future.done():
-                await refresh_rbv()
-                if fields.stop.value:
-                    if hasattr(self._driver, "stop"):
-                        await loop.run_in_executor(None, self._driver.stop)
-                    await fields.stop.write(0)
-                await async_lib.library.sleep(self._moving_poll)
             try:
-                move_future.result()
-            except Exception as exc:
-                # An unexpected driver error must not kill this loop --
-                # otherwise RBV/DMOV freeze forever. Log and recover.
-                print(f"{self.prefix}: move to {target} failed: {exc!r}",
-                      flush=True)
-            await refresh_rbv()
-            await fields.motor_is_moving.write(0)
-            await fields.done_moving_to_value.write(1)
+                await fields.done_moving_to_value.write(0)
+                await fields.motor_is_moving.write(1)
+                move_future = loop.run_in_executor(
+                    None, self._guarded_move_to, target)
+                while not move_future.done():
+                    await refresh_rbv()
+                    if fields.stop.value:
+                        if hasattr(self._driver, "stop"):
+                            await loop.run_in_executor(None, self._driver.stop)
+                        await fields.stop.write(0)
+                    await async_lib.library.sleep(self._moving_poll)
+                try:
+                    move_future.result()
+                except Exception as exc:
+                    # An unexpected driver error must not kill this loop --
+                    # otherwise RBV/DMOV freeze forever. Log and recover.
+                    print(f"{self.prefix}: move to {target} failed: {exc!r}",
+                          flush=True)
+                await refresh_rbv()
+                await fields.motor_is_moving.write(0)
+                await fields.done_moving_to_value.write(1)
+            finally:
+                # ALWAYS release the pending .VAL put -- on the happy path,
+                # after a driver error (handled above), and even if this
+                # block itself raises -- or the client's put-completion
+                # would hang forever.
+                done_event.set()
 
     def _guarded_move_to(self, target):
         try:
