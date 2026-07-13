@@ -32,6 +32,8 @@ By default, the supervisor reads `motor.json` and `daq.json` from the installed 
 
 Each controller generates one IOC process. Motors expose standard EPICS motor-record fields; E712 controllers additionally host a FLY group with waveform and line-control PVs.
 
+**Enum PV write gotcha:** CA clients cannot write enum PVs (`:MODE`, `:AXIS`, shutter `:MODE`, etc.) as bare native strings via caproto's threading client. Write by integer index, or write the string with `data_type=ChannelType.STRING` explicitly. Server-side putters receive the enum string in either case.
+
 ### Motor Record Fields
 
 Per-motor PVs are named `STXM{station}:{controller}:{axis}.*` and expose the full motor-record interface:
@@ -60,7 +62,7 @@ When an E712 controller is present, the supervisor creates one E712 IOC with a F
 | `:DWELL` | RW | **Dwell per point** (milliseconds). Must be > 0. |
 | `:AXIS` | RW | **Axis enum** (selects which motor to fly). Choices depend on controller axes; default is the first axis. |
 | `:MODE` | RW | **Fly mode:** `raster` (line repeats at START, moves to STOP, returns to START) or `continuous` (no turnaround, next line starts immediately at STOP position). |
-| `:ARM` | RW | **Arm the IOC** for a line. Write 1 to validate START/STOP/NPOINTS/DWELL and enter ARMED state. Fails silently if state is FLYING. |
+| `:ARM` | RW | **Arm the IOC** for a line. Write 1 to validate START/STOP/NPOINTS/DWELL and enter ARMED state. If state is FLYING, the ARM is rejected: `:ERROR` is set to `"ARM while FLYING rejected"` and `:STATE` is left unchanged. |
 | `:GO` | RW | **Start a fly line.** Write 1 only when state is ARMED. Blocks until the line completes or ABORT is triggered. |
 | `:ABORT` | RW | **Abort the current fly line.** Write 1 to stop the IOC-side motor and DAQ at the next sampling point. |
 | `:STATE` | RO | **IOC state:** `IDLE`, `ARMED`, `FLYING`, or `ERROR`. Read-only; only ARM, GO, and ABORT change it. |
@@ -77,9 +79,9 @@ Standalone DAQ IOCs (if no E712 group exists) expose a DaqGroup at `STXM{station
 |----|-----|-----------|
 | `:DWELL` | RW | **Dwell per point** (milliseconds, 3 decimal places). |
 | `:MODE` | RW | **Acquisition mode:** `point` (single-point acquire) or `line` (internal to FLY loop; not used in DAQ IOC standalone). |
-| `:ACQUIRE` | RW | **Single-point acquire.** Write 1 to acquire one point; put-completion waits for acquisition to finish. Returns 0 on success, logs errors via journalctl. |
+| `:ACQUIRE` | RW | **Single-point acquire.** Write 1 to acquire one point; put-completion waits for acquisition to finish. Updates `:COUNTS` and `:RATE`. |
 | `:COUNTS` | RO | **Last acquired count value.** Updated after every point. |
-| `:COUNTS:WF` | RO | **Counts waveform.** Updated by the FLY loop (internal) or by point-mode reads. |
+| `:COUNTS:WF` | RO | **Counts waveform.** Updated only by the FLY loop's `write_line` (in-process); point-mode `:ACQUIRE` does not touch it. |
 | `:RATE` | RO | **Count rate** (counts/second), computed as `COUNTS / (DWELL_ms / 1000)`. |
 
 ### Shutter/Gate Group
@@ -159,10 +161,10 @@ If a derived motor's underlying axes span multiple IOCs (or are remote), the sup
 
 ## Testing
 
-The IOC layer ships with test suites for each module:
+The IOC layer ships with test suites for each module under `tests/iocs/`. Run from the repository root, with `PYTHONPATH` set to the repo root and an interpreter from a virtual environment that has caproto and ophyd installed:
 
 ```bash
-python -m pytest pystxmcontrol/iocs/tests/
+PYTHONPATH=. python -m pytest tests/iocs -v
 ```
 
 ### Environment Setup
@@ -174,6 +176,10 @@ export EPICS_CA_MAX_ARRAY_BYTES=1000000
 ```
 
 This allows waveforms up to 16384 points to be read and written over Channel Access without truncation.
+
+## Known Limitations
+
+- **Localhost-only interfaces (named follow-up):** the standalone mains of `motor_ioc.py` and `derived_ioc.py` currently bind `interfaces=["127.0.0.1"]`, while the `e712_ioc.py`, `daq_ioc.py`, and `shutter_ioc.py` mains bind all interfaces. Motor IOCs and cross-controller derived IOCs are therefore unreachable from other hosts until interface binding is unified.
 
 ## What's Not Included (v1)
 
