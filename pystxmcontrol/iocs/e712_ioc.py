@@ -73,6 +73,11 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
     async def arm(self, instance, value):
         if not value:
             return 0
+        if STATES[_enum_index(self.state)] == "FLYING":
+            # Do NOT touch STATE or the abort event: a racing ABORT must
+            # still be able to interrupt the in-flight line.
+            await self.error.write("ARM while FLYING rejected")
+            return 0
         n = int(self.npoints.value)
         motor = self._current_motor()
         cfg = motor.config
@@ -96,8 +101,9 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
     async def go(self, instance, value):
         if not value:
             return 0
-        if STATES[_enum_index(self.state)] != "ARMED":
-            await self._set_state("ERROR", "GO before ARM")
+        current = STATES[_enum_index(self.state)]
+        if current != "ARMED":
+            await self._set_state("ERROR", f"GO rejected: state is {current}")
             return 0
         await self._set_state("FLYING")
         try:
