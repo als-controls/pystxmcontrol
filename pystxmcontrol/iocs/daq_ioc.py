@@ -42,15 +42,13 @@ class DaqGroup(PVGroup):
 
     @mode.putter
     async def mode(self, instance, value):
-        # Handle string enum values from client writes
-        if isinstance(value, (str, bytes)):
-            enum_strs = ("point", "line")
-            try:
-                if isinstance(value, bytes):
-                    value = value.decode()
-                value = enum_strs.index(value)
-            except (ValueError, AttributeError):
-                pass  # Already an index
+        # caproto delivers the enum STRING to the putter (ChannelEnum.verify_value
+        # maps a valid index write to its enum string first). Anything else --
+        # an unknown string from a STRING-dtype write, or an out-of-range index
+        # that verify_value passed through unmapped -- is rejected here.
+        if value not in instance.enum_strings:
+            raise ValueError(f"invalid MODE {value!r}; expected one of "
+                             f"{instance.enum_strings}")
         return value
 
     @acquire.putter

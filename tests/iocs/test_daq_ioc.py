@@ -48,9 +48,29 @@ def test_counts_wf_written_by_write_line(daq_ioc):
 
 
 def test_mode_enum(daq_ioc):
+    from caproto import ChannelType
     h, group = daq_ioc
     ctx = h.client()
     (mode,) = ctx.get_pvs("STXMSIM:DEFAULT:MODE")
     mode.wait_for_connection(timeout=10)
-    mode.write("line", wait=True, timeout=10)
-    assert mode.read(data_type="native").data[0] in (1, b"line", "line")
+    # A bare mode.write("line") fails CLIENT-side in caproto 1.3's numpy
+    # backend (ValueError: invalid literal for int() with base 10: b'line',
+    # _numpy_backend.py:64) -- the threading client does not map enum strings
+    # to indices for the native ENUM dtype. Write by index instead:
+    mode.write(1, wait=True, timeout=10)
+    assert mode.read(data_type="native").data[0] == 1
+    # String writes DO work when sent as a CA STRING; the server-side
+    # ChannelEnum maps them back to the enum index.
+    mode.write("point", wait=True, timeout=10, data_type=ChannelType.STRING)
+    assert mode.read(data_type="native").data[0] == 0
+
+
+def test_mode_rejects_unknown_string(daq_ioc):
+    from caproto import ChannelType
+    h, group = daq_ioc
+    ctx = h.client()
+    (mode,) = ctx.get_pvs("STXMSIM:DEFAULT:MODE")
+    mode.wait_for_connection(timeout=10)
+    with pytest.raises(Exception):
+        mode.write("bogus", wait=True, timeout=10, data_type=ChannelType.STRING)
+    assert mode.read(data_type="native").data[0] in (0, 1)  # unchanged/valid
