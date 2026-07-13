@@ -1,0 +1,56 @@
+"""Generic per-controller motor IOC.
+
+Usage (spawned by the supervisor, or standalone):
+    python -m pystxmcontrol.iocs.motor_ioc --slice /path/to/slice.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+
+from pystxmcontrol.iocs import require_caproto
+
+require_caproto()
+
+from caproto.server import run  # noqa: E402
+
+from pystxmcontrol.iocs.base import (  # noqa: E402
+    MotorRecordGroup, build_controller, build_motor)
+from pystxmcontrol.iocs.config import read_slice  # noqa: E402
+
+
+def build_pvdb_from_slice(s: dict) -> dict:
+    assert s["kind"] == "controller", s["kind"]
+    # Adapt slice format to build_controller API: controller_cls -> controller,
+    # controller_id -> address (for hardware controllers), filter non-config keys
+    controller_dict = {
+        "controller": s["controller_cls"],
+        "address": s["controller_id"],
+        "simulation": s["simulation"],
+    }
+    controller = build_controller(controller_dict)
+    pvdb: dict = {}
+    motors_by_key: dict = {}
+    for m in s["motors"]:
+        drv = build_motor(m["entry"]["driver"], controller,
+                          m["entry"], m["entry"]["axis"])
+        motors_by_key[m["key"]] = drv
+        group = MotorRecordGroup(m["pv"], driver=drv, motor_config=m["entry"])
+        pvdb.update(group.pvdb)
+    # co-located derived motors are wired in Task 5 (build_derived_colocated)
+    from pystxmcontrol.iocs.derived_ioc import build_derived_colocated
+    pvdb.update(build_derived_colocated(s, motors_by_key))
+    return pvdb
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--slice", required=True)
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+    pvdb = build_pvdb_from_slice(read_slice(args.slice))
+    run(pvdb, interfaces=["127.0.0.1"], log_pv_names=not args.quiet)
+
+
+if __name__ == "__main__":
+    main()

@@ -3,8 +3,11 @@ import asyncio
 import os
 import random
 import socket
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from caproto.threading.client import Context
@@ -124,3 +127,38 @@ def slow_sim_motor():
                 "max velocity": 1000.0, "simulation": 1}
     m.simulation = True
     return m
+
+
+@pytest.fixture
+def free_port(monkeypatch):
+    port = _free_udp_port()
+    monkeypatch.setenv("EPICS_CA_ADDR_LIST", f"127.0.0.1:{port}")
+    monkeypatch.setenv("EPICS_CA_AUTO_ADDR_LIST", "NO")
+    monkeypatch.setenv("EPICS_CAS_SERVER_PORT", str(port))
+    return port
+
+
+@pytest.fixture
+def spawn_ioc():
+    procs = []
+
+    def _spawn(module: str, slice_path: str, port: int):
+        env = dict(os.environ)
+        env.update({
+            "EPICS_CAS_SERVER_PORT": str(port),
+            "EPICS_CA_ADDR_LIST": f"127.0.0.1:{port}",
+            "EPICS_CA_AUTO_ADDR_LIST": "NO",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        })
+        p = subprocess.Popen([sys.executable, "-m", module, "--slice", slice_path],
+                             env=env)
+        procs.append(p)
+        time.sleep(3.0)  # IOC startup (driver connect + server bind)
+        assert p.poll() is None, f"{module} exited early with {p.returncode}"
+        return p
+
+    yield _spawn
+    for p in procs:
+        if p.poll() is None:
+            p.terminate()
+            p.wait(timeout=10)
