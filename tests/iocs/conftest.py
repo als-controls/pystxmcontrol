@@ -135,6 +135,10 @@ def free_port(monkeypatch):
     monkeypatch.setenv("EPICS_CA_ADDR_LIST", f"127.0.0.1:{port}")
     monkeypatch.setenv("EPICS_CA_AUTO_ADDR_LIST", "NO")
     monkeypatch.setenv("EPICS_CAS_SERVER_PORT", str(port))
+    # Client-side search (Context/get_pvs in this test process) uses
+    # EPICS_CA_SERVER_PORT, not EPICS_CAS_SERVER_PORT (server-side only) --
+    # see ioc_harness.start() above for the same gotcha.
+    monkeypatch.setenv("EPICS_CA_SERVER_PORT", str(port))
     return port
 
 
