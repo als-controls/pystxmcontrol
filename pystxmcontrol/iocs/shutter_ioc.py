@@ -46,7 +46,8 @@ class ShutterGroup(PVGroup):
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    assert s["kind"] == "shutter", s["kind"]
+    if s["kind"] != "shutter":
+        raise ValueError(f"shutter_ioc requires kind=shutter, got {s['kind']!r}")
     from pystxmcontrol.drivers.shutter import shutter as Shutter
     sh = Shutter(address=s["address"])
     sh.connect(simulation=bool(s["simulation"]))

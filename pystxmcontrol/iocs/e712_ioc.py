@@ -103,18 +103,36 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
             return 0
         current = STATES[_enum_index(self.state)]
         if current != "ARMED":
-            await self._set_state("ERROR", f"GO rejected: state is {current}")
+            if current == "FLYING":
+                # Do NOT touch STATE or the abort event: a racing GO must not
+                # clobber a healthy in-flight line's STATE with ERROR (mirrors
+                # the ARM-while-FLYING rejection above).
+                await self.error.write("GO rejected: line in progress")
+            else:
+                await self._set_state("ERROR", f"GO rejected: state is {current}")
             return 0
-        await self._set_state("FLYING")
+        # Synchronous guard closing the check-then-act race: two concurrent
+        # GO puts could both observe ARMED before either flips STATE, and
+        # both proceed to _fly_one_line(). This flag is set before the first
+        # await so the second putter's check below is atomic with respect to
+        # the first (no await happens between the state check and this set).
+        if self._flying:
+            await self.error.write("GO rejected: line in progress")
+            return 0
+        self._flying = True
         try:
-            aborted = await self._fly_one_line()
-        except Exception as exc:  # noqa: BLE001 - surfaced on :ERROR
-            await self._set_state("ERROR", str(exc)[:255])
-            return 0
-        if aborted:
-            await self._set_state("IDLE")
-        else:
-            await self._set_state("ARMED")
+            await self._set_state("FLYING")
+            try:
+                aborted = await self._fly_one_line()
+            except Exception as exc:  # noqa: BLE001 - surfaced on :ERROR
+                await self._set_state("ERROR", str(exc)[:255])
+                return 0
+            if aborted:
+                await self._set_state("IDLE")
+            else:
+                await self._set_state("ARMED")
+        finally:
+            self._flying = False
         return 0
 
     @abort.putter
@@ -129,6 +147,7 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
         self._daq_groups = daq_groups
         self._simulation = simulation
         self._abort_event = asyncio.Event()
+        self._flying = False
         self._data_props = {k: getattr(self, f"data_{k}") for k in daq_keys}
 
     async def _set_state(self, name, error_msg=""):
@@ -218,7 +237,10 @@ def FlyGroup(prefix, *, motors, daq_groups, simulation=True, **kwargs):
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    assert s["kind"] == "controller" and s["controller_cls"] == "E712Controller"
+    if not (s["kind"] == "controller" and s["controller_cls"] == "E712Controller"):
+        raise ValueError(
+            f"e712_ioc requires kind=controller/controller_cls=E712Controller, "
+            f"got kind={s['kind']!r} controller_cls={s.get('controller_cls')!r}")
     from pystxmcontrol.iocs.base import MotorRecordGroup, build_controller, build_motor
 
     controller_dict = {

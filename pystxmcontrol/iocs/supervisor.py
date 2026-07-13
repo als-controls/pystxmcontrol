@@ -39,6 +39,14 @@ def plan_fleet(fleet: FleetConfig, slice_dir: str,
     plans: list[IocPlan] = []
     e712_groups = [g for g in fleet.controller_groups
                    if g.controller_cls == "E712Controller"]
+    if len(e712_groups) > 1:
+        raise ValueError(
+            f"plan_fleet: {len(e712_groups)} E712Controller groups found "
+            f"({[g.label for g in e712_groups]}); every E712 group absorbs "
+            "ALL daq entries, so multiple E712 controllers would duplicate "
+            "DAQ PVs across IOCs and give two controllers ownership of the "
+            "same hardware. Multi-E712 DAQ mapping is a follow-up "
+            "(see docs/superpowers/2026-07-12-caproto-iocs-followups.md).")
     e712_ids = {id(g) for g in e712_groups}
     daqs_absorbed = bool(e712_groups)
     for g in fleet.controller_groups:
@@ -257,7 +265,11 @@ class Supervisor:
 
             async def main():
                 started.set()
-                await start_server(pvdb, interfaces=["127.0.0.1"])
+                # Bind all interfaces, consistent with every IOC main
+                # (e712/daq/shutter/motor/derived) -- real beamline hosts
+                # need cross-host CA reachability. Tests scope via per-test
+                # ports/EPICS_CA_ADDR_LIST, not interface binding.
+                await start_server(pvdb)
 
             try:
                 self._status_loop.run_until_complete(main())

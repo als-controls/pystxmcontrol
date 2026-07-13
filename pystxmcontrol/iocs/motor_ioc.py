@@ -19,7 +19,8 @@ from pystxmcontrol.iocs.config import read_slice  # noqa: E402
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    assert s["kind"] == "controller", s["kind"]
+    if s["kind"] != "controller":
+        raise ValueError(f"motor_ioc requires kind=controller, got {s['kind']!r}")
     # Adapt slice format to build_controller API: controller_cls -> controller,
     # controller_id -> address (for hardware controllers). Everything else in
     # the dict (besides controller/simulation/motors) is passed straight
@@ -52,7 +53,7 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     pvdb = build_pvdb_from_slice(read_slice(args.slice))
-    run(pvdb, interfaces=["127.0.0.1"], log_pv_names=not args.quiet)
+    run(pvdb, log_pv_names=not args.quiet)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from pystxmcontrol.iocs import require_caproto
 require_caproto()
 
 _AXIS_LETTER_TO_INDEX = {"x": 1, "y": 2, "z": 3}
+_AXIS_INDEX_TO_LETTER = {"axis1": "x", "axis2": "y", "axis3": "z"}
 
 
 def _ensure_controller_get_axis(controller) -> None:
@@ -138,7 +139,8 @@ class CAMotorProxy:
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    assert s["kind"] == "derived_remote", s["kind"]
+    if s["kind"] != "derived_remote":
+        raise ValueError(f"derived_ioc requires kind=derived_remote, got {s['kind']!r}")
     import pystxmcontrol.drivers as drv
     from caproto.threading.client import Context
     from pystxmcontrol.iocs.base import MotorRecordGroup
@@ -147,7 +149,13 @@ def build_pvdb_from_slice(s: dict) -> dict:
     entry = s["entry"]
     m = getattr(drv, entry["driver"])()
     for ax, pv in s["axis_pvs"].items():
-        m.axes[ax] = CAMotorProxy(pv, ctx, axis_label=ax)
+        # ``ax`` here is the derivedPiezo axes-dict KEY ("axis1"/"axis2"/...),
+        # not a real motor axis letter -- CAMotorProxy.axis_label is only used
+        # for display/getAxis, so map it to the conventional x/y/z letter by
+        # position (axis1 -> x, axis2 -> y, axis3 -> z) for a readable label.
+        # Anything beyond axis3 falls back to the raw key rather than guessing.
+        letter = _AXIS_INDEX_TO_LETTER.get(ax, ax)
+        m.axes[ax] = CAMotorProxy(pv, ctx, axis_label=letter)
     setattr(m, "config", entry)
     m.connect(axis=s["key"])
     m.offset = entry["offset"]
@@ -164,7 +172,7 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     pvdb = build_pvdb_from_slice(read_slice(args.slice))
-    run(pvdb, interfaces=["127.0.0.1"], log_pv_names=not args.quiet)
+    run(pvdb, log_pv_names=not args.quiet)
 
 
 if __name__ == "__main__":

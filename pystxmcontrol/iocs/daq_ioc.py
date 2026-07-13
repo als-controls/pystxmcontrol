@@ -84,7 +84,8 @@ def build_pvdb_for_entry(entry: dict, prefix: str):
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    assert s["kind"] == "daq", s["kind"]
+    if s["kind"] != "daq":
+        raise ValueError(f"daq_ioc requires kind=daq, got {s['kind']!r}")
     pvdb, _ = build_pvdb_for_entry(s["entry"], s["prefix"])
     return pvdb
 

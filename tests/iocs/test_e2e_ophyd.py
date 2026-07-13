@@ -9,7 +9,7 @@ import pytest
 
 os.environ.setdefault("OPHYD_CONTROL_LAYER", "caproto")
 
-from pystxmcontrol.iocs.config import load_fleet, write_slice  # noqa: E402
+from pystxmcontrol.iocs.config import load_fleet  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -72,7 +72,6 @@ def test_ophyd_epicsmotor_move_readback_stop_limits(e712_fleet_up):
 
 
 def test_full_fly_line_over_pvs(e712_fleet_up):
-    from caproto import ChannelType
     from caproto.threading.client import Context
     ctx = Context()
     names = ["START", "STOP", "NPOINTS", "DWELL", "AXIS", "ARM", "GO",

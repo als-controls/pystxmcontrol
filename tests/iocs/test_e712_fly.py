@@ -145,6 +145,33 @@ def test_arm_while_flying_rejected(fly_ioc):
     assert index.read().data[0] == 0  # aborted line never incremented INDEX
 
 
+def test_go_while_flying_rejected(fly_ioc):
+    """A second GO during an in-flight line must not clobber STATE with
+    ERROR (the GO-while-FLYING mirror of test_arm_while_flying_rejected)."""
+    h, ctx = fly_ioc
+    start, stop, npts, dwell, arm, go, abort, state, index, error = _pvs(
+        ctx, "START", "STOP", "NPOINTS", "DWELL", "ARM", "GO", "ABORT",
+        "STATE", "INDEX", "ERROR")
+    start.write(-5.0, wait=True); stop.write(5.0, wait=True)
+    npts.write(2000, wait=True); dwell.write(1.0, wait=True)  # ~2 s line
+    arm.write(1, wait=True, timeout=15)
+    t = threading.Thread(target=lambda: go.write(1, wait=True, timeout=60))
+    t.start()
+    time.sleep(0.3)
+    assert state.read().data[0] == 2  # FLYING
+    go.write(1, wait=True, timeout=15)  # mid-flight GO: must be rejected
+    assert state.read().data[0] == 2  # still FLYING; STATE untouched
+    msg = error.read(data_type="native").data
+    msg = bytes(msg).lower() if isinstance(msg[0], int) else str(msg[0]).lower()
+    assert b"line in progress" in msg if isinstance(msg, bytes) else \
+        "line in progress" in msg
+    # the original in-flight line must complete normally (unaffected by the
+    # rejected racing GO)
+    t.join(timeout=30)
+    assert state.read().data[0] == 1  # ARMED (line completed, not aborted)
+    assert index.read().data[0] == 1
+
+
 def test_go_without_arm_errors(fly_ioc):
     h, ctx = fly_ioc
     go, state = _pvs(ctx, "GO", "STATE")
