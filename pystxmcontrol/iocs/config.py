@@ -178,7 +178,7 @@ def load_fleet(motor_json_path: str, daq_json_path: str, station: str = "SIM") -
 
 # --- slice files handed to IOC subprocesses (Windows spawn-safe: path arg, not blob) ---
 
-def write_slice(group, fleet: FleetConfig, path: str) -> None:
+def write_slice(group, fleet: FleetConfig, path: str, daqs: list["DaqEntry"] | None = None) -> None:
     if isinstance(group, ControllerGroup):
         payload = {
             "kind": "controller",
@@ -192,6 +192,8 @@ def write_slice(group, fleet: FleetConfig, path: str) -> None:
             "derived": [{"key": m.key, "entry": m.entry, "pv": m.pv} for m in group.derived],
             "motor_pv": fleet.motor_pv,
         }
+        if daqs:
+            payload["daqs"] = [{"key": d.key, "entry": d.entry, "prefix": d.prefix} for d in daqs]
     elif isinstance(group, DerivedRemoteGroup):
         payload = {
             "kind": "derived_remote",
