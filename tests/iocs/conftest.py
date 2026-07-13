@@ -143,15 +143,50 @@ def free_port(monkeypatch):
 
 
 @pytest.fixture
-def spawn_ioc():
-    procs = []
+def spawn_ioc(monkeypatch):
+    """Spawn a motor/derived IOC subprocess.
 
-    def _spawn(module: str, slice_path: str, port: int):
+    Multi-IOC tests (e.g. a controller IOC + a derived_remote IOC that is
+    itself a CA client of the former) can't share one
+    EPICS_CAS_SERVER_PORT -- each server needs its own port. So this fixture
+    allocates a FRESH port on every call (the ``port`` argument passed in by
+    callers -- typically the single value from the ``free_port`` fixture --
+    is accepted for signature compatibility but ignored) and accumulates
+    ``127.0.0.1:<port>`` into a shared address list for the whole fixture.
+
+    Because caproto's EPICS_CA_ADDR_LIST entries carry an explicit port per
+    host (``host:port``), a client Context search does not strictly NEED
+    EPICS_CA_SERVER_PORT once every address in the list is fully qualified --
+    that variable only supplies a default port for addr-list entries that
+    omit one, which none of ours do. Empirically, though, unsetting it
+    entirely regresses the existing single-IOC test
+    (test_motor_ioc_subprocess), so it is still set here -- just to the
+    latest spawned IOC's own port, since with fully-qualified addr-list
+    entries its value is otherwise a no-op. This is set both in
+    ``os.environ`` (for in-test ``Context()`` instances the caller constructs
+    afterwards) and in every spawned child's env -- the derived IOC is itself
+    a CA client of the motor IOCs, so it needs the full accumulated list too,
+    not just its own port.
+    """
+    procs = []
+    addrs: list[str] = []
+
+    def _spawn(module: str, slice_path: str, port: int = None):
+        new_port = _free_udp_port()
+        addrs.append(f"127.0.0.1:{new_port}")
+        addr_list = " ".join(addrs)
+
+        monkeypatch.setenv("EPICS_CA_ADDR_LIST", addr_list)
+        monkeypatch.setenv("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        monkeypatch.setenv("EPICS_CAS_SERVER_PORT", str(new_port))
+        monkeypatch.setenv("EPICS_CA_SERVER_PORT", str(new_port))
+
         env = dict(os.environ)
         env.update({
-            "EPICS_CAS_SERVER_PORT": str(port),
-            "EPICS_CA_ADDR_LIST": f"127.0.0.1:{port}",
+            "EPICS_CAS_SERVER_PORT": str(new_port),
+            "EPICS_CA_ADDR_LIST": addr_list,
             "EPICS_CA_AUTO_ADDR_LIST": "NO",
+            "EPICS_CA_SERVER_PORT": str(new_port),
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
         })
         p = subprocess.Popen([sys.executable, "-m", module, "--slice", slice_path],
