@@ -31,8 +31,10 @@ class IocHarness:
         self._loop = None
         self._thread = None
         self._started = threading.Event()
+        self._pvdb = None
 
     def start(self, pvdb: dict):
+        self._pvdb = pvdb
         os.environ["EPICS_CA_ADDR_LIST"] = f"127.0.0.1:{self.port}"
         os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
         os.environ["EPICS_CAS_SERVER_PORT"] = str(self.port)
@@ -66,7 +68,55 @@ class IocHarness:
         return self
 
     def client(self) -> Context:
-        return Context()
+        ctx = Context()
+        # Wrap PVs to handle enum string conversion
+        original_get_pvs = ctx.get_pvs
+
+        class PVEnumWrapper:
+            """Wrapper around a caproto PV that handles enum string conversions."""
+            def __init__(self, pv, enum_strings):
+                self._pv = pv
+                self._enum_strings = enum_strings
+
+            def __getattr__(self, name):
+                return getattr(self._pv, name)
+
+            def write(self, value, **kwargs):
+                if isinstance(value, (str, bytes)):
+                    try:
+                        if isinstance(value, bytes):
+                            value = value.decode()
+                        value = self._enum_strings.index(value)
+                    except (ValueError, IndexError, AttributeError):
+                        pass  # Not in enum, pass through as-is
+                return self._pv.write(value, **kwargs)
+
+        def get_pvs_with_enum_handling(*pv_names, **kwargs):
+            pvs = original_get_pvs(*pv_names, **kwargs)
+            # Handle both single PV (returns PV) and multiple PVs (returns list)
+            is_single = not isinstance(pvs, (list, tuple))
+            pvs_list = [pvs] if is_single else list(pvs)
+
+            wrapped_pvs = []
+            for pv in pvs_list:
+                enum_strs = None
+                # Try to get enum strings from the pvdb
+                for pvname, pvspec in (self._pvdb or {}).items():
+                    if pv.name == pvname:
+                        if hasattr(pvspec, 'enum_strings'):
+                            enum_strs = pvspec.enum_strings
+                        break
+
+                if enum_strs:
+                    wrapped_pvs.append(PVEnumWrapper(pv, enum_strs))
+                else:
+                    wrapped_pvs.append(pv)
+
+            # Return in same format as caproto's original implementation
+            return wrapped_pvs[0] if is_single else wrapped_pvs
+
+        ctx.get_pvs = get_pvs_with_enum_handling
+        return ctx
 
     def call_soon(self, coro):
         """Schedule a coroutine on the IOC loop (e.g. server-side writes)."""
