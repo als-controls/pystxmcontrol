@@ -84,4 +84,11 @@ def test_slice_roundtrip(tmp_path, fleet):
     assert s["station"] == "SIM"
     assert s["kind"] == "controller"
     assert s["controller_id"] == g.controller_id
-    assert set(s["motor_pv"]) == set(fleet.motor_pv)
+    assert s["motor_pv"] == fleet.motor_pv
+    # group entries must be carried VERBATIM in the slice
+    assert s["motors"] == [
+        {"key": m.key, "entry": m.entry, "pv": m.pv} for m in g.motors
+    ]
+    assert s["derived"] == [
+        {"key": m.key, "entry": m.entry, "pv": m.pv} for m in g.derived
+    ]
