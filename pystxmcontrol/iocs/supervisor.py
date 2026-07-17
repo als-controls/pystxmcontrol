@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import os
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -97,6 +98,44 @@ def _free_udp_port() -> int:
     raise RuntimeError("no free port found")
 
 
+def _make_pdeathsig_preexec():
+    """Return a POSIX ``preexec_fn`` that asks the kernel to SIGTERM this child
+    if the supervisor dies for ANY reason -- crucially including SIGKILL, which
+    the supervisor itself can't catch and clean up after. Without it, a -9'd (or
+    crashed) supervisor leaves every IOC orphaned to init, still holding
+    hardware (e.g. the nPoint FTDI handle).
+
+    libc/prctl are resolved here at import time (main thread), so the post-fork
+    callback only makes bare syscalls -- no imports, allocations, or logging --
+    keeping it as close to async-signal-safe as a Python preexec_fn gets (it
+    runs after fork() in a child of a multithreaded process). Returns None where
+    unsupported (non-Linux), so _spawn passes ``preexec_fn=None`` there.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except Exception:
+        return None
+    PR_SET_PDEATHSIG = 1
+    sigterm = int(signal.SIGTERM)
+
+    def _preexec():
+        libc.prctl(PR_SET_PDEATHSIG, sigterm, 0, 0, 0)
+        # Race guard: if the supervisor already died between fork() and here,
+        # we've been reparented to init -- exit now instead of lingering (the
+        # parent-death signal only fires on a FUTURE parent death).
+        if os.getppid() == 1:
+            os._exit(0)
+
+    return _preexec
+
+
+# Resolved once at import (main thread); reused for every child spawn.
+_PDEATHSIG_PREEXEC = _make_pdeathsig_preexec()
+
+
 class Supervisor:
     def __init__(self, plans: list[IocPlan],
                  restart_backoff=(1, 2, 4, 8, 16, 30),
@@ -180,7 +219,11 @@ class Supervisor:
         return subprocess.Popen(
             cmd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, encoding="utf-8", errors="replace")
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
+            # Kernel-enforced cleanup: SIGTERM this IOC if the supervisor dies
+            # for any reason (incl. SIGKILL/crash), so it can never outlive us
+            # as an orphan. None (non-Linux) leaves default behavior.
+            preexec_fn=_PDEATHSIG_PREEXEC)
 
     def _pump_output(self, name: str, proc: subprocess.Popen):
         """Relay one child's merged stdout/stderr to ours, line by line,
@@ -388,12 +431,27 @@ def main(argv=None):
                      ca_host=args.host, slice_dir=slice_dir,
                      quiet_iocs=args.quiet_iocs)
     sup.start()
+
+    # Stop gracefully on BOTH SIGTERM (a plain `kill`, and what most process
+    # managers / `pkill` send) and SIGINT (Ctrl-C). Previously only
+    # KeyboardInterrupt was caught, so `kill <supervisor>` terminated the
+    # supervisor outright without running sup.stop() -- leaving every child
+    # IOC running and re-parented to init (orphaned, still holding hardware).
+    stop_requested = threading.Event()
+
+    def _handle_signal(signum, _frame):
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
-        while True:
-            time.sleep(1)
+        while not stop_requested.wait(1.0):
+            pass
     except KeyboardInterrupt:
-        print("[stxm-iocs] shutting down")
-        sup.stop()
+        pass  # belt-and-braces if SIGINT is delivered as an exception
+    print("[stxm-iocs] shutting down")
+    sup.stop()
 
 
 if __name__ == "__main__":

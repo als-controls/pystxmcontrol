@@ -1,3 +1,6 @@
+import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -7,6 +10,31 @@ import pytest
 from pystxmcontrol.iocs.config import load_fleet
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def _children_of(ppid: int) -> list[int]:
+    """PIDs whose parent is ``ppid`` (Linux /proc; ppid is field 4 of stat,
+    read after the ')' that closes the possibly-space-containing comm field)."""
+    kids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        fields = stat[stat.rfind(")") + 1:].split()
+        if len(fields) >= 2 and int(fields[1]) == ppid:
+            kids.append(int(entry.name))
+    return kids
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 @pytest.fixture
@@ -330,3 +358,93 @@ def test_console_script_declared():
     py = tomllib.loads((REPO / "pyproject.toml").read_text())
     assert py["project"]["scripts"]["stxm-iocs"] == "pystxmcontrol.iocs.supervisor:main"
     assert "caproto>=1.1" in py["project"]["optional-dependencies"]["iocs"]
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(),
+                    reason="needs /proc to enumerate child pids")
+def test_sigterm_stops_all_child_iocs(tmp_path):
+    """A plain SIGTERM to the supervisor (not just Ctrl-C/SIGINT) must tear
+    down every child IOC -- otherwise they are orphaned to init and keep
+    holding hardware. Regression for the KeyboardInterrupt-only shutdown."""
+    cmd = [
+        sys.executable, str(REPO / "pystxmcontrol" / "iocs" / "supervisor.py"),
+        "--station", "SIGTESTSIM",  # unique prefix: no clash with a live fleet
+        "--motor-config", str(REPO / "config" / "motor.json"),
+        "--daq-config", str(REPO / "config" / "daq.json"),
+        "--slice-dir", str(tmp_path),
+        "--status-interval", "0", "--startup-delay", "0",
+        "--shared-ca-port", "--quiet-iocs",
+    ]
+    proc = subprocess.Popen(cmd)
+    kids: list[int] = []
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            kids = _children_of(proc.pid)
+            if len(kids) >= 2:
+                break
+            time.sleep(0.5)
+        assert len(kids) >= 2, f"child IOCs never started (got {kids})"
+
+        proc.send_signal(signal.SIGTERM)   # the case that used to orphan them
+        proc.wait(timeout=30)              # supervisor itself must exit
+
+        deadline = time.time() + 20
+        while time.time() < deadline and any(_alive(k) for k in kids):
+            time.sleep(0.5)
+        survivors = [k for k in kids if _alive(k)]
+        assert not survivors, f"orphaned IOCs survived SIGTERM: {survivors}"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for k in kids:
+            try:
+                os.kill(k, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="PR_SET_PDEATHSIG is Linux-only")
+def test_sigkill_supervisor_still_reaps_child_iocs(tmp_path):
+    """Even an uncatchable SIGKILL of the supervisor must not orphan its IOCs:
+    PR_SET_PDEATHSIG makes the kernel signal each child when the supervisor
+    dies. Regression for orphaned IOCs holding hardware after a hard kill."""
+    cmd = [
+        sys.executable, str(REPO / "pystxmcontrol" / "iocs" / "supervisor.py"),
+        "--station", "PDEATHSIM",
+        "--motor-config", str(REPO / "config" / "motor.json"),
+        "--daq-config", str(REPO / "config" / "daq.json"),
+        "--slice-dir", str(tmp_path),
+        "--status-interval", "0", "--startup-delay", "0",
+        "--shared-ca-port", "--quiet-iocs",
+    ]
+    proc = subprocess.Popen(cmd)
+    kids: list[int] = []
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            kids = _children_of(proc.pid)
+            if len(kids) >= 2:
+                break
+            time.sleep(0.5)
+        assert len(kids) >= 2, f"child IOCs never started (got {kids})"
+
+        proc.send_signal(signal.SIGKILL)  # supervisor can't clean up itself
+        proc.wait(timeout=30)
+
+        deadline = time.time() + 20
+        while time.time() < deadline and any(_alive(k) for k in kids):
+            time.sleep(0.5)
+        survivors = [k for k in kids if _alive(k)]
+        assert not survivors, (
+            f"IOCs orphaned after supervisor SIGKILL: {survivors} "
+            "(PR_SET_PDEATHSIG not effective)")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for k in kids:
+            try:
+                os.kill(k, signal.SIGKILL)
+            except OSError:
+                pass
