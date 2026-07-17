@@ -255,8 +255,13 @@ class nptController(hardwareController):
         if dataw != 6:
             raise nptCommError(
                 f"read command to {hex(addr)} short-wrote {dataw}/6 bytes")
-        # response is a 6-byte frame: [lead][b0 b1 b2 b3][0x55]
-        datar = self._readResponse(10, 6)
+        # The controller echoes the command's addr back ahead of the value, so
+        # the response is a 10-byte frame: [readCom][addr b0 b1 b2 b3][value b0
+        # b1 b2 b3][0x55]. Reading only 6 bytes (the prior port's mistake) left
+        # datar[1:5] on the ADDRESS -- e.g. a bogus ~0x1183xxxx ~27777 um that
+        # tripped getPos()'s outlier guard. Read the full frame; after reverse,
+        # [1:5] is the little-endian value (matches the legacy driver).
+        datar = self._readResponse(10, 10)
         datar.reverse()
         val = '0x' + datar[1:5].hex()
         return self.hexToSignedInt(val)
@@ -270,9 +275,12 @@ class nptController(hardwareController):
         if dataw != 10:
             raise nptCommError(
                 f"readArray command to {hex(addr)} short-wrote {dataw}/10 bytes")
-        # response frame is [lead][4*numBytes value bytes][0x55]
-        response_len = 4 * numBytes + 2
-        datar = self._readResponse(6 + 4*numBytes, response_len)
+        # Like readFromDev4B, the frame carries the echoed cmd+addr prefix:
+        # [readArrayCom][addr 4 bytes][value 4*numBytes bytes][0x55], i.e.
+        # 6 + 4*numBytes bytes total. Read the whole frame; after reverse,
+        # [1:1+4*numBytes] is the value (matches the legacy driver).
+        response_len = 6 + 4 * numBytes
+        datar = self._readResponse(response_len, response_len)
         datar.reverse()
         val = datar[1:1+4*numBytes]
         retVal = '0x' + val.hex()

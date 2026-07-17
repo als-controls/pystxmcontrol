@@ -168,15 +168,20 @@ class nptMotor(motor):
             travel_range = max_val - min_val
             lower_bound = min_val - travel_range
             upper_bound = max_val + travel_range
+            last_converted = None
             for attempt in range(5):
                 pos = self.controller.getPos(axis=self._axis)
                 converted = pos * self.config["units"] + self.config["offset"]
+                last_converted = converted
                 if lower_bound <= converted <= upper_bound:
                     self.position = converted
                     return self.position
                 if attempt < 4:
                     time.sleep(0.02)
-            print(f"[nptMotor] getPos: encoder outlier on axis {self.axis} after 5 attempts, returning last known position {self.position:.3f}")
+            print(f"[nptMotor] getPos: encoder outlier on axis {self.axis} after "
+                  f"5 attempts (last read {last_converted:.3f} um, outside "
+                  f"[{lower_bound:.1f}, {upper_bound:.1f}]), returning last known "
+                  f"position {self.position:.3f}")
             return self.position
         else:
             return self.position
