@@ -33,17 +33,24 @@ def build_pvdb_from_slice(s: dict) -> dict:
         "simulation": s["simulation"],
     }
     controller = build_controller(controller_dict)
+    # One lock per controller: every motor on it serializes its blocking
+    # driver transactions through this, so the axes' RBV pollers never
+    # interleave two frames on a shared link (e.g. one FTDI handle for both
+    # nPoint axes).
+    import threading
+    io_lock = threading.Lock()
     pvdb: dict = {}
     motors_by_key: dict = {}
     for m in s["motors"]:
         drv = build_motor(m["entry"]["driver"], controller,
                           m["entry"], m["entry"]["axis"])
         motors_by_key[m["key"]] = drv
-        group = MotorRecordGroup(m["pv"], driver=drv, motor_config=m["entry"])
+        group = MotorRecordGroup(m["pv"], driver=drv, motor_config=m["entry"],
+                                 io_lock=io_lock)
         pvdb.update(group.pvdb)
     # co-located derived motors are wired in Task 5 (build_derived_colocated)
     from pystxmcontrol.iocs.derived_ioc import build_derived_colocated
-    pvdb.update(build_derived_colocated(s, motors_by_key))
+    pvdb.update(build_derived_colocated(s, motors_by_key, io_lock=io_lock))
     return pvdb
 
 

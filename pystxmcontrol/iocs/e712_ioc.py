@@ -147,7 +147,8 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
             self._abort_event.set()
         return 0
 
-    def __init__(self, prefix, *, motors, daq_groups, simulation=True, **kwargs):
+    def __init__(self, prefix, *, motors, daq_groups, simulation=True,
+                 io_lock=None, **kwargs):
         PVGroup.__init__(self, prefix, **kwargs)
         self._motors = motors
         self._daq_groups = daq_groups
@@ -155,6 +156,10 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
         self._abort_event = asyncio.Event()
         self._flying = False
         self._data_props = {k: getattr(self, f"data_{k}") for k in daq_keys}
+        # Shared with the motor records on the same controller so a fly line's
+        # motor I/O never interleaves with the axes' RBV pollers on the link.
+        import threading
+        self._io_lock = io_lock if io_lock is not None else threading.Lock()
 
     async def _set_state(self, name, error_msg=""):
         await self.state.write(name)
@@ -192,30 +197,38 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                 lines[key] = get_task.result()
             else:  # pragma: no cover - hardware path, benchmark-only (Task 12)
                 motor = self._current_motor()
-                motor.trajectory_pixel_count = n
-                motor.trajectory_pixel_dwell = dwell
-                motor.lineMode = "continuous"
-                # Drivers with a 2D (x, y) trajectory tuple (e.g. nptMotor)
-                # infer the fast axis from whichever slot varies, so place the
-                # scan endpoints in the slot matching the selected :AXIS and
-                # hold the perpendicular axis at its current position. Single-
-                # axis drivers ignore the second slot.
                 axis_label = self.axis.enum_strings[_enum_index(self.axis)]
                 other_label = "x" if axis_label == "y" else "y"
                 other_motor = self._motors.get(other_label)
-                perp = (other_motor.getPos()
-                        if other_motor is not None
-                        and hasattr(other_motor, "getPos") else 0.0)
-                if axis_label == "y":
-                    motor.trajectory_start = (perp, x0)
-                    motor.trajectory_stop = (perp, x1)
-                else:
-                    motor.trajectory_start = (x0, perp)
-                    motor.trajectory_stop = (x1, perp)
-                motor.update_trajectory()
+
+                def _run_line():
+                    # All motor-side I/O for the line runs here, in one worker
+                    # thread holding the controller lock, so it never
+                    # interleaves with the axes' RBV pollers (or the other
+                    # axis) on the shared link. Drivers stay lock-agnostic, so
+                    # calling their methods under the lock can't self-deadlock.
+                    with self._io_lock:
+                        # Hold the perpendicular axis at its current position;
+                        # 2D (x, y) trajectory drivers (e.g. nptMotor) infer
+                        # the fast axis from whichever slot varies.
+                        perp = (other_motor.getPos()
+                                if other_motor is not None
+                                and hasattr(other_motor, "getPos") else 0.0)
+                        motor.trajectory_pixel_count = n
+                        motor.trajectory_pixel_dwell = dwell
+                        motor.lineMode = "continuous"
+                        if axis_label == "y":
+                            motor.trajectory_start = (perp, x0)
+                            motor.trajectory_stop = (perp, x1)
+                        else:
+                            motor.trajectory_start = (x0, perp)
+                            motor.trajectory_stop = (x1, perp)
+                        motor.update_trajectory()
+                        motor.moveLine()
+
                 line, _ = await asyncio.gather(
                     daq.getLine(),
-                    loop.run_in_executor(None, motor.moveLine))
+                    loop.run_in_executor(None, _run_line))
                 lines[key] = line
 
         positions = np.linspace(x0, x1, n)
@@ -245,16 +258,20 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
     return type("FlyGroup", (PVGroup,), namespace)
 
 
-def FlyGroup(prefix, *, motors, daq_groups, simulation=True, **kwargs):
+def FlyGroup(prefix, *, motors, daq_groups, simulation=True, io_lock=None,
+             **kwargs):
     """Instantiate a FLY PVGroup wired to the given motors/DAQ groups.
 
     ``motors`` maps enum axis label -> driver; ``daq_groups`` maps a DAQ key
     -> an already-built ``daq_ioc.DaqGroup`` instance (co-hosted in the same
     IOC process, so the fly loop can call ``write_line`` on it directly).
+    ``io_lock`` is the controller's shared transaction lock (see
+    MotorRecordGroup); pass the same lock used for this controller's motor
+    records so a fly line serializes with their RBV pollers.
     """
     cls = _fly_group_class(list(motors), list(daq_groups))
     return cls(prefix, motors=motors, daq_groups=daq_groups,
-               simulation=simulation, **kwargs)
+               simulation=simulation, io_lock=io_lock, **kwargs)
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
@@ -275,6 +292,10 @@ def build_pvdb_from_slice(s: dict) -> dict:
         "simulation": s["simulation"],
     }
     controller = build_controller(controller_dict)
+    # One lock per controller, shared by every motor record AND the fly loop,
+    # so no two blocking transactions overlap on the controller's link.
+    import threading
+    io_lock = threading.Lock()
     pvdb: dict = {}
     motors = {}
     for m in s["motors"]:
@@ -282,7 +303,8 @@ def build_pvdb_from_slice(s: dict) -> dict:
                           m["entry"]["axis"])
         motors[m["entry"]["axis"]] = drv
         pvdb.update(MotorRecordGroup(m["pv"], driver=drv,
-                                     motor_config=m["entry"]).pvdb)
+                                     motor_config=m["entry"],
+                                     io_lock=io_lock).pvdb)
 
     daq_groups = {}
     for d in s.get("daqs", []):
@@ -293,7 +315,7 @@ def build_pvdb_from_slice(s: dict) -> dict:
     if daq_groups:
         fly_prefix = f"STXM{s['station']}:{s['label']}:FLY"
         fly = FlyGroup(fly_prefix, motors=motors, daq_groups=daq_groups,
-                       simulation=bool(s["simulation"]))
+                       simulation=bool(s["simulation"]), io_lock=io_lock)
         pvdb.update(fly.pvdb)
     return pvdb
 

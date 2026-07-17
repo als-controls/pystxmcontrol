@@ -48,7 +48,11 @@ class nptMotor(motor):
             self.controller.setupStages()
             self._axis = self.controller.getAxis(self.axis)
             self.pid = self.controller.pidRead(axis = self._axis)
-            self.position = self.controller.getPos(axis = self._axis)
+            # Latch the initial position through the bounds-checked getPos(),
+            # not the raw controller read: a garbled first read (e.g. a link
+            # still settling) would otherwise be stored as self.position and
+            # then returned forever as the outlier fallback.
+            self.position = self.getPos()
 
     def checkLimits(self, pos):
         return self.config["minValue"] <= pos <= self.config["maxValue"]

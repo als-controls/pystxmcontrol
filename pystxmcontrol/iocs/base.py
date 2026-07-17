@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 from caproto.server import PVGroup, pvproperty
 
@@ -60,13 +61,23 @@ class MotorRecordGroup(PVGroup):
     motor = pvproperty(value=0.0, name="", record="motor", precision=3)
 
     def __init__(self, prefix, *, driver, motor_config,
-                 idle_poll=0.1, moving_poll=0.02, **kwargs):
+                 idle_poll=0.1, moving_poll=0.02, io_lock=None, **kwargs):
         super().__init__(prefix, **kwargs)
         self._driver = driver
         self._motor_config = motor_config
         self._idle_poll = idle_poll
         self._moving_poll = moving_poll
         self._move_queue: asyncio.Queue = asyncio.Queue()
+        # Serializes every blocking driver transaction (getPos/moveTo/stop/
+        # setAxisParams) for this motor. Motors that share a controller (and
+        # therefore a single, non-reentrant link -- e.g. one FTDI handle for
+        # both nPoint axes) MUST be given the SAME lock so their RBV pollers
+        # and moves never interleave two write/read frames on the wire, which
+        # otherwise corrupts one axis's response into garbage. A fly loop that
+        # drives the same controller acquires this lock too. Drivers stay
+        # lock-agnostic; all locking happens at this IOC orchestration layer,
+        # so holding the lock while calling a driver method never re-enters it.
+        self._io_lock = io_lock if io_lock is not None else threading.Lock()
 
     @motor.startup
     async def motor(self, instance, async_lib):
@@ -112,11 +123,13 @@ class MotorRecordGroup(PVGroup):
                 last_velocity = current
                 if hasattr(self._driver, "setAxisParams"):
                     await loop.run_in_executor(
-                        None, lambda: self._driver.setAxisParams(velocity=current))
+                        None, self._locked_call,
+                        lambda: self._driver.setAxisParams(velocity=current))
 
         async def refresh_rbv():
             try:
-                pos = await loop.run_in_executor(None, self._driver.getPos)
+                pos = await loop.run_in_executor(
+                    None, self._locked_call, self._driver.getPos)
             except Exception as exc:
                 # A transient driver read error (e.g. a truncated USB response
                 # from the controller) must NOT kill the IOC. This runs inside
@@ -146,8 +159,15 @@ class MotorRecordGroup(PVGroup):
                 await fields.motor_is_moving.write(1)
                 move_future = loop.run_in_executor(
                     None, self._guarded_move_to, target)
+                # Do NOT poll getPos() while the move runs: _guarded_move_to
+                # holds the controller lock for the whole move, so a getPos on
+                # the shared link would both collide with the move's own
+                # transactions and block this loop (starving STOP). Just watch
+                # for STOP -- issued WITHOUT the lock, because it must PREEMPT
+                # the in-flight move; drivers implement stop() as an out-of-band
+                # abort/flag, not a bus transaction that would queue behind the
+                # move. RBV is refreshed once the move releases the link, below.
                 while not move_future.done():
-                    await refresh_rbv()
                     if fields.stop.value:
                         if hasattr(self._driver, "stop"):
                             await loop.run_in_executor(None, self._driver.stop)
@@ -170,8 +190,17 @@ class MotorRecordGroup(PVGroup):
                 # would hang forever.
                 done_event.set()
 
+    def _locked_call(self, fn, *args):
+        """Run a blocking driver call holding this motor's controller lock, so
+        no two transactions on the shared link overlap. Runs in an executor
+        thread; the lock is a plain threading.Lock (not reentrant), and driver
+        methods never take it themselves, so nesting can't self-deadlock."""
+        with self._io_lock:
+            return fn(*args)
+
     def _guarded_move_to(self, target):
-        try:
-            self._driver.moveTo(target)
-        except SoftwareLimitError:
-            pass  # belt-and-braces; the write hook's HLM/LLM check runs first
+        with self._io_lock:
+            try:
+                self._driver.moveTo(target)
+            except SoftwareLimitError:
+                pass  # belt-and-braces; the write hook's HLM/LLM check runs first

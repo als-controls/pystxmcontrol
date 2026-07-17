@@ -48,7 +48,8 @@ def _ensure_controller_get_axis(controller) -> None:
     controller.getAxis = getAxis
 
 
-def build_derived_colocated(slice_dict: dict, motors_by_key: dict) -> dict:
+def build_derived_colocated(slice_dict: dict, motors_by_key: dict,
+                            io_lock=None) -> dict:
     import pystxmcontrol.drivers as drv
     from pystxmcontrol.iocs.base import MotorRecordGroup
 
@@ -67,7 +68,11 @@ def build_derived_colocated(slice_dict: dict, motors_by_key: dict) -> dict:
         m.offset = entry["offset"]
         m.units = entry["units"]
         motors_by_key[d["key"]] = m
-        group = MotorRecordGroup(d["pv"], driver=m, motor_config=entry)
+        # A co-located derived motor reads/writes its underlying axes on the
+        # same controller, so it shares the controller's io_lock to serialize
+        # with the primary axes' pollers on the shared link.
+        group = MotorRecordGroup(d["pv"], driver=m, motor_config=entry,
+                                 io_lock=io_lock)
         pvdb.update(group.pvdb)
     return pvdb
 
