@@ -5,6 +5,18 @@ import time
 import struct
 import numpy as np
 
+
+class nptCommError(Exception):
+    """The nPoint controller returned an unreadable response.
+
+    Raised for an empty or truncated USB read that cannot be decoded into a
+    32-bit value -- e.g. the controller is unpowered/disconnected, or a
+    fragmented FTDI transfer never completed within the read timeout. A
+    dedicated type lets IOC callers catch a comms hiccup and recover instead
+    of eating a bare ValueError from int(..., 16).
+    """
+
+
 class nptController(hardwareController):
 
     def __init__(self, address = '7340010', port = None, simulation = False):
@@ -57,6 +69,10 @@ class nptController(hardwareController):
         self.axesList = ["x","y"]
         self._stageRange = 100.
         self._countsPerMicron = 2**20 / self._stageRange
+        # Max seconds to spend reassembling one device response before giving
+        # up (see _readResponse). Bounds the old `while datar == b''` spin so
+        # an absent controller raises nptCommError instead of hanging.
+        self._read_timeout = 1.0
 
     def initialize(self, simulation = False):
         self.simulation = simulation
@@ -181,7 +197,11 @@ class nptController(hardwareController):
         return addr
 
     def hexToSignedInt(self, h): #converts hex numbers to signed int
-        hInt = int(h[2:],16)
+        digits = h[2:] if h[:2] == "0x" else h
+        if not digits:
+            raise nptCommError(
+                f"cannot decode empty device response {h!r} as an integer")
+        hInt = int(digits, 16)
         if hInt <= 0x7FFFFFFF:
             return hInt
         else:
@@ -201,6 +221,31 @@ class nptController(hardwareController):
     def hexToFloat64(self, h):
         return struct.unpack('<d', struct.pack('<Q', int(h, 16)))[0]
 
+    def _readResponse(self, request_len, response_len):
+        """Read one full device response, reassembling short/fragmented reads.
+
+        pylibftdi's Device.read(n) returns *up to* n bytes, so a single read
+        can come back empty or truncated -- especially the first read after
+        opening the FTDI device. Accumulate until we have the full expected
+        frame, bounded by self._read_timeout so an unresponsive controller
+        raises nptCommError rather than spinning forever (the old
+        `while datar == b''` loop) or decoding a truncated buffer (which made
+        the value slice empty and blew up int('', 16)).
+        """
+        buf = bytearray()
+        deadline = time.monotonic() + self._read_timeout
+        while len(buf) < response_len:
+            chunk = self.dev.read(request_len)
+            if chunk:
+                buf.extend(chunk)
+                continue
+            if time.monotonic() > deadline:
+                raise nptCommError(
+                    f"nPoint controller {self.devID} returned "
+                    f"{len(buf)}/{response_len} bytes within "
+                    f"{self._read_timeout}s (device not responding?)")
+        return buf[:response_len]
+
     def readFromDev4B(self, addr): # to read 32bit values, e.g. position or servo state
         # format: [readCom] [address] [0x55] for a total of 6 bytes
         readTX = 0x55 * 16**10 + addr * 16**2 + self.readCom
@@ -208,15 +253,12 @@ class nptController(hardwareController):
         readTX.reverse()
         dataw = self.dev.write(bytes(readTX))
         if dataw != 6:
-            print("dataw =", dataw)
-            raise("reading value: writing to \"read address\" on device failed")
-        datar = self.dev.read(10)
-        while datar == b'':
-            datar = self.dev.read(10)
-        datar = bytearray(datar)
+            raise nptCommError(
+                f"read command to {hex(addr)} short-wrote {dataw}/6 bytes")
+        # response is a 6-byte frame: [lead][b0 b1 b2 b3][0x55]
+        datar = self._readResponse(10, 6)
         datar.reverse()
-        val = datar[1:5]
-        val = '0x' + val.hex()
+        val = '0x' + datar[1:5].hex()
         return self.hexToSignedInt(val)
 
     def readArray(self, numBytes, addr): # e.g. to read PID parameters as 64bit float, use numBytes=2
@@ -226,12 +268,11 @@ class nptController(hardwareController):
         readTX.reverse()
         dataw = self.dev.write(bytes(readTX))
         if dataw != 10:
-            print("dataw =", dataw)
-            raise("reading value: writing to \"read address\" on device failed")
-        datar = self.dev.read(6 + 4*numBytes)
-        while datar == b'':
-            datar = self.dev.read(6 + 4*numBytes)
-        datar = bytearray(datar)
+            raise nptCommError(
+                f"readArray command to {hex(addr)} short-wrote {dataw}/10 bytes")
+        # response frame is [lead][4*numBytes value bytes][0x55]
+        response_len = 4 * numBytes + 2
+        datar = self._readResponse(6 + 4*numBytes, response_len)
         datar.reverse()
         val = datar[1:1+4*numBytes]
         retVal = '0x' + val.hex()
