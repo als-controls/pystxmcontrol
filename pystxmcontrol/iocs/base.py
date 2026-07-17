@@ -115,7 +115,19 @@ class MotorRecordGroup(PVGroup):
                         None, lambda: self._driver.setAxisParams(velocity=current))
 
         async def refresh_rbv():
-            pos = await loop.run_in_executor(None, self._driver.getPos)
+            try:
+                pos = await loop.run_in_executor(None, self._driver.getPos)
+            except Exception as exc:
+                # A transient driver read error (e.g. a truncated USB response
+                # from the controller) must NOT kill the IOC. This runs inside
+                # the startup hook, so an escaping exception propagates through
+                # caproto's _server_startup and shuts the whole server down.
+                # Log and keep the last-known RBV; the next poll retries.
+                # Mirrors the move path's "driver error must not kill this
+                # loop" guard below.
+                print(f"{self.prefix}: position read failed: {exc!r}",
+                      flush=True)
+                return
             await fields.user_readback_value.write(pos)
 
         await refresh_rbv()
