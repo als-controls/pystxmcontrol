@@ -172,8 +172,9 @@ def test_supervisor_spawn_sets_per_ioc_env(tmp_path, monkeypatch):
     captured = {}
 
     class FakePopen:
-        def __init__(self, cmd, env=None):
+        def __init__(self, cmd, env=None, **kwargs):
             captured[cmd[-1]] = env
+            self.args = cmd
 
     monkeypatch.setattr(supervisor_mod.subprocess, "Popen", FakePopen)
 
@@ -205,6 +206,89 @@ def test_supervisor_shared_ca_port_escape_hatch(tmp_path):
     sup._allocate_ports()
     assert sup._ports == {}
     assert not (tmp_path / "EPICS_CA_ADDR_LIST.txt").exists()
+
+
+def _capture_spawn(monkeypatch):
+    """Monkeypatch subprocess.Popen and return the dict it records into."""
+    import pystxmcontrol.iocs.supervisor as supervisor_mod
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, cmd, env=None, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = env
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(supervisor_mod.subprocess, "Popen", FakePopen)
+    return captured
+
+
+def test_spawn_pipes_and_merges_child_output(tmp_path, monkeypatch):
+    """The child is spawned with its stdout captured on a pipe and stderr
+    merged into it, so the supervisor can relay everything the IOC prints."""
+    import subprocess
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+
+    captured = _capture_spawn(monkeypatch)
+    plans = [IocPlan(name="daq", module="pystxmcontrol.iocs.daq_ioc",
+                     slice_path=str(tmp_path / "daq.json"))]
+    sup = Supervisor(plans, status_prefix=None, slice_dir=str(tmp_path))
+    sup._spawn(plans[0])
+
+    kw = captured["kwargs"]
+    assert kw["stdout"] is subprocess.PIPE
+    assert kw["stderr"] is subprocess.STDOUT
+    assert kw["text"] is True
+    # unbuffered so lines reach the relay promptly instead of block-buffering
+    assert captured["env"]["PYTHONUNBUFFERED"] == "1"
+
+
+def test_spawn_omits_quiet_by_default_but_honors_quiet_iocs(tmp_path, monkeypatch):
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+
+    plan = IocPlan(name="daq", module="pystxmcontrol.iocs.daq_ioc",
+                   slice_path=str(tmp_path / "daq.json"))
+
+    captured = _capture_spawn(monkeypatch)
+    Supervisor([plan], status_prefix=None, slice_dir=str(tmp_path))._spawn(plan)
+    assert "--quiet" not in captured["cmd"]  # PV list visible by default
+
+    captured = _capture_spawn(monkeypatch)
+    Supervisor([plan], status_prefix=None, slice_dir=str(tmp_path),
+               quiet_iocs=True)._spawn(plan)
+    assert "--quiet" in captured["cmd"]
+
+
+def test_pump_output_relays_lines_tagged_with_ioc_name(tmp_path, capsys):
+    """_pump_output forwards each child line to our stdout, prefixed by the
+    IOC name, and stops cleanly at EOF."""
+    import io
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+
+    class FakeProc:
+        stdout = io.StringIO("Server startup complete.\n"
+                             "PVs available:\nSTXMSIM:DAQ:COUNTS\n")
+
+    sup = Supervisor([IocPlan(name="daq", module="m", slice_path="s")],
+                     status_prefix=None, slice_dir=str(tmp_path))
+    sup._pump_output("daq", FakeProc())
+
+    out = capsys.readouterr().out
+    assert "[daq] Server startup complete." in out
+    assert "[daq] PVs available:" in out
+    assert "[daq] STXMSIM:DAQ:COUNTS" in out
+
+
+def test_pump_output_tolerates_missing_stdout(tmp_path):
+    """A spawn double with no pipe (stdout=None) must not raise."""
+    from pystxmcontrol.iocs.supervisor import IocPlan, Supervisor
+
+    class FakeProc:
+        stdout = None
+
+    sup = Supervisor([IocPlan(name="x", module="m", slice_path="s")],
+                     status_prefix=None, slice_dir=str(tmp_path))
+    sup._pump_output("x", FakeProc())  # no exception
 
 
 def test_console_script_declared():

@@ -104,15 +104,21 @@ class Supervisor:
                  status_interval: float = 0.0,
                  shared_ca_port: bool = False,
                  ca_host: str = "127.0.0.1",
-                 slice_dir: str | None = None):
+                 slice_dir: str | None = None,
+                 quiet_iocs: bool = False):
         self._plans = plans
         self._backoff = restart_backoff
         self._status_prefix = status_prefix
         self._status_interval = status_interval
+        self._quiet_iocs = quiet_iocs
         self._procs: dict[str, subprocess.Popen | None] = {}
         self._restarts: dict[str, int] = {p.name: 0 for p in plans}
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Serializes writes to our own stdout: one relay thread per running
+        # IOC plus the status table loop all print concurrently, so without
+        # this a PV-list line can interleave mid-line with the status table.
+        self._io_lock = threading.Lock()
         self._status_loop: asyncio.AbstractEventLoop | None = None
         self._status_channels: dict[str, tuple] = {}
         self._shared_ca_port = shared_ca_port
@@ -144,10 +150,15 @@ class Supervisor:
         if plan.module is None:
             cmd = [sys.executable, plan.slice_path]
         else:
-            cmd = [sys.executable, "-m", plan.module,
-                   "--slice", plan.slice_path, "--quiet"]
+            cmd = [sys.executable, "-m", plan.module, "--slice", plan.slice_path]
+            if self._quiet_iocs:
+                cmd.append("--quiet")
         env = dict(os.environ)
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
+        # Children write to a pipe now (see stdout=PIPE below); force unbuffered
+        # so their banner/PV-list lines reach our relay promptly instead of
+        # sitting in a block buffer until the pipe fills or the IOC exits.
+        env["PYTHONUNBUFFERED"] = "1"
         if not self._shared_ca_port and plan.name in self._ports:
             # NOTE: this caproto version's server binds using
             # EPICS_CA_SERVER_PORT (see caproto/server/common.py Context.__init__
@@ -160,7 +171,34 @@ class Supervisor:
             env["EPICS_CA_SERVER_PORT"] = str(self._ports[plan.name])
             env["EPICS_CA_ADDR_LIST"] = self._addr_list
             env["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
-        return subprocess.Popen(cmd, env=env)
+        # Capture the child's stdout+stderr on one pipe so we can relay it to
+        # our own stdout tagged by IOC name (see _pump_output). Without this
+        # the caproto startup banner and PV-name list -- which each IOC now
+        # logs via configure_ioc_logging -- would either scatter unlabeled
+        # across the shared console or be lost entirely when the supervisor's
+        # stdout is redirected to a file/journal.
+        return subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding="utf-8", errors="replace")
+
+    def _pump_output(self, name: str, proc: subprocess.Popen):
+        """Relay one child's merged stdout/stderr to ours, line by line,
+        prefixed with the IOC name. Runs on its own daemon thread and returns
+        when the child's pipe reaches EOF (i.e. the process has exited)."""
+        stream = proc.stdout
+        if stream is None:  # e.g. a test double that didn't open a pipe
+            return
+        prefix = f"[{name}] "
+        try:
+            for line in stream:
+                text = prefix + line.rstrip("\n") + "\n"
+                with self._io_lock:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+        except (ValueError, OSError):
+            # stream closed underneath us during shutdown -- nothing to relay
+            return
 
     def _monitor(self, plan: IocPlan):
         if plan.delay and self._stopping.wait(plan.delay):
@@ -169,6 +207,11 @@ class Supervisor:
         while not self._stopping.is_set():
             proc = self._spawn(plan)
             self._procs[plan.name] = proc
+            # Fresh pipe per (re)spawn, so a fresh relay thread per (re)spawn;
+            # each ends at its own pipe's EOF when that process exits.
+            pump = threading.Thread(target=self._pump_output,
+                                    args=(plan.name, proc), daemon=True)
+            pump.start()
             self._publish(plan.name, running=1)
             healthy_since = time.monotonic()
             while proc.poll() is None:
@@ -189,8 +232,9 @@ class Supervisor:
             self._publish(plan.name, restarts=self._restarts[plan.name])
             delay = self._backoff[min(attempt, len(self._backoff) - 1)]
             attempt += 1
-            print(f"[stxm-iocs] {plan.name} exited rc={proc.returncode}; "
-                  f"restart in {delay}s (restart #{self._restarts[plan.name]})")
+            with self._io_lock:
+                print(f"[stxm-iocs] {plan.name} exited rc={proc.returncode}; "
+                      f"restart in {delay}s (restart #{self._restarts[plan.name]})")
             if self._stopping.wait(delay):
                 return
 
@@ -239,10 +283,12 @@ class Supervisor:
 
     def _table_loop(self):
         while not self._stopping.wait(self._status_interval):
-            print(f"{'IOC':<24} {'RUNNING':<8} {'RESTARTS':<8} PID")
+            lines = [f"{'IOC':<24} {'RUNNING':<8} {'RESTARTS':<8} PID"]
             for name, st in self.status().items():
-                print(f"{name:<24} {int(st['running']):<8} "
-                      f"{st['restarts']:<8} {st['pid'] or '-'}")
+                lines.append(f"{name:<24} {int(st['running']):<8} "
+                             f"{st['restarts']:<8} {st['pid'] or '-'}")
+            with self._io_lock:
+                print("\n".join(lines))
 
     # -- status PVs ---------------------------------------------------------
     def _start_status_server(self):
@@ -315,6 +361,11 @@ def main(argv=None):
     parser.add_argument("--startup-delay", type=float, default=3.0)
     parser.add_argument("--host", default="127.0.0.1",
                         help="host used in per-IOC EPICS_CA_ADDR_LIST entries")
+    parser.add_argument("--quiet-iocs", action="store_true",
+                        help="pass --quiet to each IOC, suppressing its "
+                             "startup PV-name list. By default the supervisor "
+                             "relays each IOC's stdout (banner + PV list) to "
+                             "its own output, tagged with the IOC name.")
     parser.add_argument("--shared-ca-port", action="store_true",
                         help="disable per-IOC CA server ports and use the "
                              "default port 5064 for every IOC (prior "
@@ -334,7 +385,8 @@ def main(argv=None):
     sup = Supervisor(plans, status_prefix=f"STXM{args.station}:SUP",
                      status_interval=args.status_interval,
                      shared_ca_port=args.shared_ca_port,
-                     ca_host=args.host, slice_dir=slice_dir)
+                     ca_host=args.host, slice_dir=slice_dir,
+                     quiet_iocs=args.quiet_iocs)
     sup.start()
     try:
         while True:

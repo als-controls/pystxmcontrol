@@ -11,7 +11,7 @@ import functools
 
 import numpy as np
 
-from pystxmcontrol.iocs import require_caproto
+from pystxmcontrol.iocs import configure_ioc_logging, require_caproto
 
 require_caproto()
 
@@ -278,6 +278,7 @@ def main(argv=None):
     parser.add_argument("--slice", required=True)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
+    configure_ioc_logging()
     run(build_pvdb_from_slice(read_slice(args.slice)), log_pv_names=not args.quiet)
 
 
