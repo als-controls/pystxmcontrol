@@ -14,6 +14,15 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", name.strip())
 
 
+# Controller classes whose motors implement the IOC-side line-fly interface
+# (update_trajectory/moveLine/trajectory_* + continuous lineMode). A controller
+# group built from one of these is served by the fly IOC (motor records + a FLY
+# PVGroup that absorbs the DAQ entries) instead of the plain motor IOC. Both
+# supervisor.plan_fleet (routing) and e712_ioc.build_pvdb_from_slice (guard)
+# read this set so the two stay in agreement.
+FLY_CAPABLE_CONTROLLERS = {"E712Controller", "nptController"}
+
+
 @dataclass
 class MotorEntry:
     key: str

@@ -59,6 +59,40 @@ def test_plan_fleet_e712_absorbs_daqs(tmp_path):
     assert not [p for p in plans if p.module == "pystxmcontrol.iocs.daq_ioc"]
 
 
+def test_plan_fleet_npt_absorbs_daqs(tmp_path):
+    """A fly-capable nptController group is routed to the fly IOC and absorbs
+    the DAQ entries (no standalone daq_ioc), just like an E712 group."""
+    import json
+    cfg = {
+        "FineX": {
+            "index": 0, "type": "primary", "axis": "x", "driver": "nptMotor",
+            "controllerID": "7340015A", "port": 0, "controller": "nptController",
+            "max velocity": 1000.0, "minValue": -50.0, "maxValue": 50.0,
+            "offset": 0.0, "units": 1.0, "display": True, "simulation": 1,
+        },
+        "FineY": {
+            "index": 1, "type": "primary", "axis": "y", "driver": "nptMotor",
+            "controllerID": "7340015A", "port": 0, "controller": "nptController",
+            "max velocity": 1000.0, "minValue": -50.0, "maxValue": 50.0,
+            "offset": 0.0, "units": 1.0, "display": True, "simulation": 1,
+        },
+    }
+    mp = tmp_path / "motor.json"
+    mp.write_text(json.dumps(cfg))
+    fleet = load_fleet(str(mp), str(REPO / "config" / "daq.json"), station="SIM")
+    if not fleet.controller_groups:
+        pytest.skip("nptController unavailable in this env")
+    from pystxmcontrol.iocs.supervisor import plan_fleet
+    from pystxmcontrol.iocs.config import read_slice
+    plans = plan_fleet(fleet, str(tmp_path / "slices"))
+    fly = [p for p in plans if p.module == "pystxmcontrol.iocs.e712_ioc"]
+    assert len(fly) == 1
+    s = read_slice(fly[0].slice_path)
+    assert s["controller_cls"] == "nptController"
+    assert [d["key"] for d in s["daqs"]] == ["default"]
+    assert not [p for p in plans if p.module == "pystxmcontrol.iocs.daq_ioc"]
+
+
 def test_plan_fleet_rejects_multiple_e712_groups(tmp_path):
     """Two E712Controller groups would both try to absorb ALL daq entries
     (duplicate PVs + double hardware ownership) -- plan_fleet must reject
@@ -82,7 +116,7 @@ def test_plan_fleet_rejects_multiple_e712_groups(tmp_path):
             if g.controller_cls == "E712Controller"]) < 2:
         pytest.skip("E712Controller unavailable in this env (pipython guard) "
                      "or the two controllerIDs were grouped into one")
-    with pytest.raises(ValueError, match="E712Controller groups"):
+    with pytest.raises(ValueError, match="fly-capable controller groups"):
         plan_fleet(fleet, str(tmp_path / "slices"))
 
 

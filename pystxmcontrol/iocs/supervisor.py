@@ -22,7 +22,7 @@ from pystxmcontrol.iocs import require_caproto
 require_caproto()
 
 from pystxmcontrol.iocs.config import (  # noqa: E402
-    FleetConfig, load_fleet, write_slice)
+    FLY_CAPABLE_CONTROLLERS, FleetConfig, load_fleet, write_slice)
 
 
 @dataclass
@@ -37,21 +37,21 @@ def plan_fleet(fleet: FleetConfig, slice_dir: str,
                shutter_iocs: bool = True, startup_delay: float = 3.0) -> list[IocPlan]:
     Path(slice_dir).mkdir(parents=True, exist_ok=True)
     plans: list[IocPlan] = []
-    e712_groups = [g for g in fleet.controller_groups
-                   if g.controller_cls == "E712Controller"]
-    if len(e712_groups) > 1:
+    fly_groups = [g for g in fleet.controller_groups
+                  if g.controller_cls in FLY_CAPABLE_CONTROLLERS]
+    if len(fly_groups) > 1:
         raise ValueError(
-            f"plan_fleet: {len(e712_groups)} E712Controller groups found "
-            f"({[g.label for g in e712_groups]}); every E712 group absorbs "
-            "ALL daq entries, so multiple E712 controllers would duplicate "
+            f"plan_fleet: {len(fly_groups)} fly-capable controller groups found "
+            f"({[g.label for g in fly_groups]}); every fly group absorbs "
+            "ALL daq entries, so multiple fly controllers would duplicate "
             "DAQ PVs across IOCs and give two controllers ownership of the "
-            "same hardware. Multi-E712 DAQ mapping is a follow-up "
+            "same hardware. Multi-fly DAQ mapping is a follow-up "
             "(see docs/superpowers/2026-07-12-caproto-iocs-followups.md).")
-    e712_ids = {id(g) for g in e712_groups}
-    daqs_absorbed = bool(e712_groups)
+    fly_ids = {id(g) for g in fly_groups}
+    daqs_absorbed = bool(fly_groups)
     for g in fleet.controller_groups:
         p = str(Path(slice_dir) / f"{g.label}.json")
-        if id(g) in e712_ids:
+        if id(g) in fly_ids:
             write_slice(g, fleet, p, daqs=fleet.daqs)
             plans.append(IocPlan(name=g.label, module="pystxmcontrol.iocs.e712_ioc",
                                  slice_path=p))

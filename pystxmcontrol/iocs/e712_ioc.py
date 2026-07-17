@@ -1,4 +1,10 @@
-"""E712 fly IOC: motor records + FLY PVGroup with an IOC-side line loop.
+"""Fly IOC: motor records + FLY PVGroup with an IOC-side line loop.
+
+Serves any fly-capable controller group (see config.FLY_CAPABLE_CONTROLLERS,
+e.g. E712Controller, nptController) -- the line loop is controller-agnostic and
+drives the selected axis motor through the duck-typed fly interface
+(trajectory_* attrs + update_trajectory/moveLine + continuous lineMode). Kept
+under the historical module name ``e712_ioc`` for import/back-compat stability.
 
 Consistency contract: on each completed line, ALL data/pos waveforms are
 written BEFORE :INDEX increments. Clients monitor :INDEX, then read waveforms.
@@ -189,8 +195,23 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                 motor.trajectory_pixel_count = n
                 motor.trajectory_pixel_dwell = dwell
                 motor.lineMode = "continuous"
-                motor.trajectory_start = (x0, 0.0)
-                motor.trajectory_stop = (x1, 0.0)
+                # Drivers with a 2D (x, y) trajectory tuple (e.g. nptMotor)
+                # infer the fast axis from whichever slot varies, so place the
+                # scan endpoints in the slot matching the selected :AXIS and
+                # hold the perpendicular axis at its current position. Single-
+                # axis drivers ignore the second slot.
+                axis_label = self.axis.enum_strings[_enum_index(self.axis)]
+                other_label = "x" if axis_label == "y" else "y"
+                other_motor = self._motors.get(other_label)
+                perp = (other_motor.getPos()
+                        if other_motor is not None
+                        and hasattr(other_motor, "getPos") else 0.0)
+                if axis_label == "y":
+                    motor.trajectory_start = (perp, x0)
+                    motor.trajectory_stop = (perp, x1)
+                else:
+                    motor.trajectory_start = (x0, perp)
+                    motor.trajectory_stop = (x1, perp)
                 motor.update_trajectory()
                 line, _ = await asyncio.gather(
                     daq.getLine(),
@@ -237,10 +258,14 @@ def FlyGroup(prefix, *, motors, daq_groups, simulation=True, **kwargs):
 
 
 def build_pvdb_from_slice(s: dict) -> dict:
-    if not (s["kind"] == "controller" and s["controller_cls"] == "E712Controller"):
+    from pystxmcontrol.iocs.config import FLY_CAPABLE_CONTROLLERS
+
+    if not (s["kind"] == "controller"
+            and s["controller_cls"] in FLY_CAPABLE_CONTROLLERS):
         raise ValueError(
-            f"e712_ioc requires kind=controller/controller_cls=E712Controller, "
-            f"got kind={s['kind']!r} controller_cls={s.get('controller_cls')!r}")
+            f"fly IOC requires kind=controller with a fly-capable controller_cls "
+            f"({sorted(FLY_CAPABLE_CONTROLLERS)}), got kind={s['kind']!r} "
+            f"controller_cls={s.get('controller_cls')!r}")
     from pystxmcontrol.iocs.base import MotorRecordGroup, build_controller, build_motor
 
     controller_dict = {
