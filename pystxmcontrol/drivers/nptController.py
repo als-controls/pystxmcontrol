@@ -819,8 +819,13 @@ class nptController(hardwareController):
         self.writeNext(self.timeToCounts(0.0))#dwell/1000.))
 
         #enable position trigger pulse
-        #if trigger_position is not None:
-        #    self.setPositionTrigger(trigger_position, trigger_axis, mode = 'on')
+        #A continuous fly line is gated by a SINGLE position-trigger pulse
+        #emitted as the stage crosses the line-start coordinate; the counter
+        #(armed via INIT:IMM with TRIG:SOUR EXT) then free-runs its N samples.
+        #Without this the line moves but no gate pulse ever reaches the counter,
+        #so getLine()'s FETC? blocks forever and the fly IOC wedges in FLYING.
+        if trigger_position is not None:
+            self.setPositionTrigger(pos = trigger_position, axis = trigger_axis, mode = 'on')
 
         #Start the trajectory
         self.writeToDev4B(0x11829048,1)
@@ -836,9 +841,11 @@ class nptController(hardwareController):
 
         #Stop the trajectory, just to be certain?
         self.writeToDev4B(0x1182904C,1)
-        
-        #Turn OFF position trigger pulses
-        #self.setPositionTrigger() #turns OFF by default
+
+        #Turn OFF position trigger pulses (mode='off' by default) so the pixel
+        #pulse pins don't keep firing after the line completes.
+        if trigger_position is not None:
+            self.setPositionTrigger(axis = trigger_axis, mode = 'off')
 
     def compile_FlyPos(self):
         # some parameters to generate the Flyscan positions, could be obtained from the Flyscan dictionary

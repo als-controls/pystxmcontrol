@@ -18,7 +18,7 @@ def sanitize(name: str) -> str:
 # (update_trajectory/moveLine/trajectory_* + continuous lineMode). A controller
 # group built from one of these is served by the fly IOC (motor records + a FLY
 # PVGroup that absorbs the DAQ entries) instead of the plain motor IOC. Both
-# supervisor.plan_fleet (routing) and e712_ioc.build_pvdb_from_slice (guard)
+# supervisor.plan_fleet (routing) and fly_ioc.build_pvdb_from_slice (guard)
 # read this set so the two stay in agreement.
 FLY_CAPABLE_CONTROLLERS = {"E712Controller", "nptController"}
 
@@ -203,6 +203,9 @@ def write_slice(group, fleet: FleetConfig, path: str, daqs: list["DaqEntry"] | N
         }
         if daqs:
             payload["daqs"] = [{"key": d.key, "entry": d.entry, "prefix": d.prefix} for d in daqs]
+        # gate address -> shutter :MODE PV prefix, so the fly IOC can drive the
+        # beam shutter (owned by the shutter IOC) over CA during a line.
+        payload["shutters"] = {sh.address: sh.prefix for sh in fleet.shutters}
     elif isinstance(group, DerivedRemoteGroup):
         payload = {
             "kind": "derived_remote",

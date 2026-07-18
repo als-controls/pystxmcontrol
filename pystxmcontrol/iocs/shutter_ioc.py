@@ -32,7 +32,14 @@ class ShutterGroup(PVGroup):
         loop = asyncio.get_running_loop()
 
         def apply():
-            self._shutter.mode = _MODE_MAP[str(value)]
+            mode = _MODE_MAP[str(value)]
+            self._shutter.mode = mode
+            # OPEN forces the beam continuously open via the software gate
+            # (softGATE=1): a continuous fly free-runs the counter with no
+            # per-dwell hardware gate pulse, so the shutter must be HELD open
+            # for the whole line (mirrors legacy autoGateOpen). CLOSED/AUTO
+            # leave softGATE=0 so the shutter stays hardware-gated.
+            self._shutter.softGATE = 1 if mode == "open" else 0
             self._shutter.setStatus()
 
         await loop.run_in_executor(None, apply)

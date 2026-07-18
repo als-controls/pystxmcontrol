@@ -80,7 +80,7 @@ def test_plan_fleet_e712_absorbs_daqs(tmp_path):
     from pystxmcontrol.iocs.supervisor import plan_fleet
     from pystxmcontrol.iocs.config import read_slice
     plans = plan_fleet(fleet, str(tmp_path / "slices"))
-    e712 = [p for p in plans if p.module == "pystxmcontrol.iocs.e712_ioc"]
+    e712 = [p for p in plans if p.module == "pystxmcontrol.iocs.fly_ioc"]
     assert len(e712) == 1
     s = read_slice(e712[0].slice_path)
     assert [d["key"] for d in s["daqs"]] == ["default"]
@@ -113,7 +113,7 @@ def test_plan_fleet_npt_absorbs_daqs(tmp_path):
     from pystxmcontrol.iocs.supervisor import plan_fleet
     from pystxmcontrol.iocs.config import read_slice
     plans = plan_fleet(fleet, str(tmp_path / "slices"))
-    fly = [p for p in plans if p.module == "pystxmcontrol.iocs.e712_ioc"]
+    fly = [p for p in plans if p.module == "pystxmcontrol.iocs.fly_ioc"]
     assert len(fly) == 1
     s = read_slice(fly[0].slice_path)
     assert s["controller_cls"] == "nptController"

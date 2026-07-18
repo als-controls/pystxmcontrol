@@ -54,7 +54,7 @@ def plan_fleet(fleet: FleetConfig, slice_dir: str,
         p = str(Path(slice_dir) / f"{g.label}.json")
         if id(g) in fly_ids:
             write_slice(g, fleet, p, daqs=fleet.daqs)
-            plans.append(IocPlan(name=g.label, module="pystxmcontrol.iocs.e712_ioc",
+            plans.append(IocPlan(name=g.label, module="pystxmcontrol.iocs.fly_ioc",
                                  slice_path=p))
         else:
             write_slice(g, fleet, p)
