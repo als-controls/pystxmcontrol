@@ -289,8 +289,15 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                     stage["name"] = "connect"
                     await group._ensure_started()
                     stage["name"] = "config"
+                    # Trigger source is a driver capability: motors with no
+                    # hardware trigger output (e.g. MMC) declare
+                    # line_trigger = "INT" and the DAQ free-runs during the
+                    # line; absent attribute keeps the EXT line-start
+                    # trigger contract (nPoint, E712).
+                    line_trigger = getattr(motor, "line_trigger", "EXT")
                     await loop.run_in_executor(None, functools.partial(
-                        daq.config, dwell, count=1, samples=n, trigger="EXT"))
+                        daq.config, dwell, count=1, samples=n,
+                        trigger=line_trigger))
                     stage["name"] = "arm"
                     await loop.run_in_executor(None, daq.initLine)
                     stage["name"] = "beam_open"

@@ -20,7 +20,7 @@ def sanitize(name: str) -> str:
 # PVGroup that absorbs the DAQ entries) instead of the plain motor IOC. Both
 # supervisor.plan_fleet (routing) and fly_ioc.build_pvdb_from_slice (guard)
 # read this set so the two stay in agreement.
-FLY_CAPABLE_CONTROLLERS = {"E712Controller", "nptController"}
+FLY_CAPABLE_CONTROLLERS = {"E712Controller", "nptController", "mmcController"}
 
 
 @dataclass
