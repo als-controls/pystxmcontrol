@@ -76,18 +76,21 @@ When an E712 controller is present, the supervisor creates one E712 IOC with a F
 The following controllers are supported for continuous fly-line scanning:
 
 - `e712Controller` (Physik Instrumente E-712): trigger-synchronized fly lines.
-  The E712 outputs a trigger pulse per point, enabling zero-skew DAQ
-  synchronization via `line_trigger = "EXT"` (hardware-timed, low-latency).
+  The counter is configured `count=1, samples=n` and acquires the whole line
+  off a SINGLE hardware line-start trigger from the E712
+  (`line_trigger = "EXT"`, hardware-timed, low-latency).
 
-- `nptController` (Newport MM-3000): constant-velocity software-timed fly lines.
-  The nptController supports velocity profile upload; DAQ is typically
-  free-run (external trigger not available on legacy serial models).
+- `nptController` (nPoint LC400 piezo controller, pylibftdi/USB): fly lines
+  with a hardware line-start trigger output; `line_trigger` stays `"EXT"`
+  (same single line-start trigger contract as the E712).
 
 - `mmcController` (Micronix MMC): constant-velocity software-timed fly lines.
-  The MMC has no trigger output, so `mmcMotor.line_trigger = "INT"` makes the
-  DAQ free-run during the line (start-skew of a few ms; positions are nominal
-  `linspace`). Transport is serial (`COM*`/`/dev/tty*`, 38400 8N1) or TCP
-  (`address` + nonzero `port`), chosen from the address format.
+  The MMC has no trigger output, so `mmcMotor.line_trigger = "IMM"`
+  (free-run) makes the DAQ free-run during the line; the fly loop
+  pre-positions the axis before arming so acquisition starts at the line
+  start (start-skew of a few ms; positions are nominal `linspace`).
+  Transport is serial (`COM*`/`/dev/tty*`, 38400 8N1) or TCP (`address` +
+  nonzero `port`), chosen from the address format.
 
 ### DAQ Group (Keysight Counter Family)
 
