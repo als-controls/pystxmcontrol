@@ -167,3 +167,75 @@ def test_simulation_move_and_readback():
     m.moveTo(5.0)
     assert m.getPos() == pytest.approx(5.0)
     assert m.getStatus() is False
+
+
+def test_update_trajectory_computes_velocity_from_fast_axis():
+    m, _ = make_motor(replies=[])
+    m.trajectory_start = (-1.0, 0.0)  # fast axis = x (varies)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0  # ms -> line time 2 s, span 2 -> 1 u/s
+    m.update_trajectory()
+    assert m.line_velocity == pytest.approx(1.0)
+    assert (m._line_start, m._line_stop) == (-1.0, 1.0)
+    assert m.npositions == 20
+
+
+def test_update_trajectory_picks_y_when_it_varies():
+    m, _ = make_motor(axis="y")
+    m.trajectory_start = (3.0, -2.0)
+    m.trajectory_stop = (3.0, 2.0)
+    m.trajectory_pixel_count = 10
+    m.trajectory_pixel_dwell = 200.0
+    m.update_trajectory()
+    assert (m._line_start, m._line_stop) == (-2.0, 2.0)
+
+
+def test_update_trajectory_rejects_unflyable_line():
+    from pystxmcontrol.drivers.mmcController import MMCError
+    m, _ = make_motor()  # max velocity 2.0 (ENTRY)
+    m.trajectory_start = (-10.0, 0.0)
+    m.trajectory_stop = (10.0, 0.0)
+    m.trajectory_pixel_count = 10
+    m.trajectory_pixel_dwell = 1.0  # 20 units in 10 ms -> 2000 u/s
+    with pytest.raises(MMCError):
+        m.update_trajectory()
+
+
+def test_move_line_sequence_and_velocity_restore():
+    # replies consumed in order:
+    #   VEL? (cruise) -> moveTo(start) STA? idle -> line MVA STA? idle
+    m, t = make_motor(replies=["#0,1.000000\n", "#8\n", "#8\n"])
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0
+    m.update_trajectory()
+    m.moveLine()
+    w = t.writes
+    # w[0] is connect()'s "1FBK3\r"
+    assert w[1] == "1VEL?\r"               # read cruise velocity first
+    assert "1MVA-1.0\r" in w               # move to line start
+    assert "1VEL1.0\r" in w                # line velocity
+    assert "1MVA1.0\r" in w                # constant-velocity line move
+    assert w[-1] == "1VEL1.0\r"            # cruise restored last
+    # line velocity set BEFORE the line move
+    assert w.index("1VEL1.0\r") < w.index("1MVA1.0\r")
+
+
+def test_move_line_simulation_lands_on_stop():
+    from pystxmcontrol.drivers.mmcController import mmcController
+    from pystxmcontrol.drivers.mmcMotor import mmcMotor
+    ctrl = mmcController(address="COM99")
+    ctrl.initialize(simulation=True)
+    m = mmcMotor()
+    m.controller = ctrl
+    m.config = dict(ENTRY)
+    m.connect(axis="x")
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 5
+    m.trajectory_pixel_dwell = 200.0
+    m.update_trajectory()
+    m.moveLine()
+    assert m.getPos() == pytest.approx(1.0)

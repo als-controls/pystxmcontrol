@@ -134,3 +134,58 @@ class mmcMotor(motor):
     def configure_home(self, direction=0):
         if not self.simulation:
             self.controller.command(self._axis, f"HCG{int(direction)}")
+
+    # ---- fly interface (duck-typed; driven by iocs/fly_ioc.py) ---------
+    def update_trajectory(self, direction="forward", include_return=False):
+        """Compute the constant velocity for a software-timed fly line.
+
+        The MMC flies one axis at constant velocity; the fast axis is
+        whichever trajectory slot varies (fly_ioc holds the other constant).
+        """
+        x0, y0 = self.trajectory_start
+        x1, y1 = self.trajectory_stop
+        if abs(x1 - x0) >= abs(y1 - y0):
+            start, stop = x0, x1
+        else:
+            start, stop = y0, y1
+        if direction == "backward":
+            start, stop = stop, start
+        line_time = self.trajectory_pixel_count * self.trajectory_pixel_dwell / 1000.0
+        if line_time <= 0:
+            raise MMCError("fly line has non-positive duration")
+        velocity = abs(stop - start) / line_time / abs(self.config["units"])
+        max_v = self.config.get("max velocity")
+        if max_v and velocity > float(max_v):
+            raise MMCError(
+                f"fly line needs {velocity:.3f} units/s > max velocity "
+                f"{max_v}; increase dwell or shorten the line")
+        self._line_start, self._line_stop = start, stop
+        self.line_velocity = velocity
+        self.npositions = self.trajectory_pixel_count
+
+    def moveLine(self, **kwargs):
+        """Blocking constant-velocity line move (runs under fly_ioc's
+        io_lock in an executor thread). DAQ acquisition free-runs
+        concurrently (line_trigger = "INT")."""
+        line_time = self.trajectory_pixel_count * self.trajectory_pixel_dwell / 1000.0
+        if self.simulation:
+            time.sleep(min(line_time, 0.1))
+            self.controller.positions[self._axis] = \
+                (self._line_stop - self.config["offset"]) / self.config["units"]
+            return
+        cruise = self.get_velocity()
+        self.moveTo(self._line_start)
+        self.setAxisParams(velocity=self.line_velocity)
+        try:
+            self.controller.command(
+                self._axis, f"MVA{self._to_controller(self._line_stop)}")
+            deadline = time.time() + max(5.0, line_time * 4.0 + 5.0)
+            while self.getStatus():
+                if time.time() > deadline:
+                    self.stop()
+                    raise MMCError(
+                        f"MMC fly line on axis {self.axis} stalled "
+                        f"(no completion within {line_time * 4 + 5:.1f}s)")
+                time.sleep(self._poll)
+        finally:
+            self.setAxisParams(velocity=cruise)
