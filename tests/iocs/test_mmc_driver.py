@@ -237,7 +237,9 @@ def test_update_trajectory_rejects_zero_span():
 def test_prepare_line_then_move_line_split_sequence():
     # prepareLine: VEL? (cruise) -> MVA(start)+STA? poll -> VEL(line).
     # moveLine (prepared): only MVA(stop) -> STA? polls -> VEL restore.
-    m, t = make_motor(replies=["#0,1.000000\n",  # VEL? cruise
+    # Cruise (0.5) deliberately differs from line velocity (1.0) so the
+    # restore assertion can't be satisfied by the line-velocity write.
+    m, t = make_motor(replies=["#0,0.500000\n",  # VEL? cruise
                                "#8\n",           # moveTo(start) STA? idle
                                "#8\n"])          # line MVA STA? idle
     m.trajectory_start = (-1.0, 0.0)
@@ -257,7 +259,33 @@ def test_prepare_line_then_move_line_split_sequence():
     # prepared moveLine: no re-positioning, no VEL? re-read
     assert tail[0] == "1MVA1.0\r"
     assert "1VEL?\r" not in tail and "1MVA-1.0\r" not in tail
-    assert tail[-1] == "1VEL1.0\r"  # cruise restored last
+    assert tail[-1] == "1VEL0.5\r"  # CRUISE (not line velocity) restored last
+    assert m._prepared is False
+
+
+def test_re_prepare_after_abort_keeps_original_cruise():
+    # Abort between prepareLine and moveLine leaves the axis at line
+    # velocity with _prepared=True; a second prepareLine must NOT re-stash
+    # the (still-set) line velocity as cruise.
+    m, t = make_motor(replies=["#0,0.500000\n",  # 1st prepare: VEL? cruise
+                               "#8\n",           # 1st prepare: MVA(start) idle
+                               "#8\n",           # 2nd prepare: MVA(start) idle
+                               "#8\n"])          # moveLine: line MVA idle
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0
+    m.update_trajectory()
+    m.prepareLine()
+    assert m._cruise_velocity == pytest.approx(0.5)
+    # ... line aborted here (no moveLine); axis left at line velocity ...
+    n_writes = len(t.writes)
+    m.prepareLine()
+    # no VEL? re-read on the second prepare (stash preserved)
+    assert "1VEL?\r" not in t.writes[n_writes:]
+    assert m._cruise_velocity == pytest.approx(0.5)
+    m.moveLine()
+    assert t.writes[-1] == "1VEL0.5\r"  # original cruise restored
     assert m._prepared is False
 
 

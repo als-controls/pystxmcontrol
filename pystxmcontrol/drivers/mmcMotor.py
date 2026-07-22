@@ -184,7 +184,15 @@ class mmcMotor(motor):
         if self.simulation:
             self._prepared = True
             return
-        self._cruise_velocity = self.get_velocity()
+        # Abort window: if the line is aborted between prepareLine and
+        # moveLine (e.g. during the DAQ arm or beam-open stage), the axis is
+        # left at line velocity with _prepared still True until the next
+        # completed line's finally restores cruise. Only stash cruise when
+        # not already prepared, so a re-prepare after such an abort reuses
+        # the ORIGINAL cruise velocity instead of stashing the still-set
+        # line velocity and losing the operator's setting.
+        if not self._prepared:
+            self._cruise_velocity = self.get_velocity()
         self.moveTo(self._line_start)
         self.setAxisParams(velocity=self.line_velocity)
         self._prepared = True
