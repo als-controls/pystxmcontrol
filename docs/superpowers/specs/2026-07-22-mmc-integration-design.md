@@ -105,12 +105,17 @@ has no trigger output. **Chosen default (Ron): software-timed lines.**
 
 - Motor drivers gain an optional class attribute `line_trigger`
   (default `"EXT"` — preserves current npt/E712 behavior when absent).
-  `mmcMotor.line_trigger = "INT"`.
+  `mmcMotor.line_trigger = "IMM"` — "IMM (free-run)" is the 53230A
+  `TRIG:SOUR` mnemonic (the instrument accepts IMM|EXT|BUS; "INT" would
+  queue an SCPI error).
 - `fly_ioc._hw_line` reads `getattr(motor, "line_trigger", "EXT")` and
-  passes it to `daq.config`; for `"INT"` it skips the external-trigger arm
-  path and starts acquisition immediately before commanding the move
-  (accepted start-skew: a few ms — nominal positions are already the
-  contract for this class of axis).
+  passes it to `daq.config`; for `"IMM"` (any non-EXT value), `initLine`
+  (INIT:IMM) starts acquisition immediately, so the trajectory setup and
+  pre-positioning (move to line start, set line velocity — driver
+  `prepareLine()`) run in a dedicated "prepare" stage BEFORE the arm;
+  the "move" stage then only commands the constant-velocity move
+  (`moveLine()` on a prepared axis). Accepted start-skew: a few ms —
+  nominal positions are already the contract for this class of axis.
 - If Friday shows an external gate is available, flipping the config back to
   `"EXT"` per-axis is a one-line change.
 
@@ -133,7 +138,7 @@ there; groups without DAQs simply get no FLY PVGroup).
   clamp behavior.
 - IOC-level (simulation over real CA, patterned on `test_npt_fly.py`):
   MMC slice → motor record moves + RBV; fly line ARM/GO in simulation;
-  `line_trigger="INT"` selection in the fly path exercised with a stubbed
+  `line_trigger="IMM"` selection in the fly path exercised with a stubbed
   DAQ.
 
 ## Error handling summary

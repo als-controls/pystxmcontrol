@@ -9,9 +9,11 @@ def test_mmc_is_fly_capable():
     assert "mmcController" in FLY_CAPABLE_CONTROLLERS
 
 
-def test_mmc_motor_declares_internal_trigger():
+def test_mmc_motor_declares_immediate_trigger():
+    # "IMM" is the 53230A TRIG:SOUR free-run mnemonic (IMM|EXT|BUS);
+    # "INT" is not a valid 53230A trigger source.
     from pystxmcontrol.drivers.mmcMotor import mmcMotor
-    assert mmcMotor.line_trigger == "INT"
+    assert mmcMotor.line_trigger == "IMM"
 
 
 def test_npt_default_stays_external():
@@ -23,6 +25,22 @@ def test_npt_default_stays_external():
     import inspect
     src = inspect.getsource(fly_ioc)
     assert 'getattr(motor, "line_trigger", "EXT")' in src
+
+
+def test_fly_free_run_prepares_before_arm():
+    # With a non-EXT (free-run) trigger, initLine (INIT:IMM) starts
+    # acquisition immediately, so _hw_line must run a "prepare" stage
+    # (trajectory setup + pre-positioning via motor.prepareLine) BEFORE
+    # the "arm" stage. EXT path stays unchanged (gated on the trigger).
+    import inspect
+    from pystxmcontrol.iocs import fly_ioc
+    src = inspect.getsource(fly_ioc)
+    assert 'if line_trigger != "EXT":' in src
+    assert 'stage["name"] = "prepare"' in src
+    assert 'motor.prepareLine()' in src
+    # ordering: prepare stage precedes the arm stage in the source
+    assert src.index('stage["name"] = "prepare"') < \
+        src.index('stage["name"] = "arm"')
 
 
 def test_fly_slice_builds_for_mmc(tmp_path):

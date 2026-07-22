@@ -223,6 +223,88 @@ def test_move_line_sequence_and_velocity_restore():
     assert w.index("1VEL1.0\r") < w.index("1MVA1.0\r")
 
 
+def test_update_trajectory_rejects_zero_span():
+    from pystxmcontrol.drivers.mmcController import MMCError
+    m, _ = make_motor()
+    m.trajectory_start = (3.0, 0.0)
+    m.trajectory_stop = (3.0, 0.0)  # zero span on both slots
+    m.trajectory_pixel_count = 10
+    m.trajectory_pixel_dwell = 100.0
+    with pytest.raises(MMCError):
+        m.update_trajectory()
+
+
+def test_prepare_line_then_move_line_split_sequence():
+    # prepareLine: VEL? (cruise) -> MVA(start)+STA? poll -> VEL(line).
+    # moveLine (prepared): only MVA(stop) -> STA? polls -> VEL restore.
+    m, t = make_motor(replies=["#0,1.000000\n",  # VEL? cruise
+                               "#8\n",           # moveTo(start) STA? idle
+                               "#8\n"])          # line MVA STA? idle
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0
+    m.update_trajectory()
+    m.prepareLine()
+    prep = list(t.writes)
+    # w[0] is connect()'s "1FBK3\r"
+    assert prep[1] == "1VEL?\r"
+    assert prep[2] == "1MVA-1.0\r"
+    assert prep[-1] == "1VEL1.0\r"  # line velocity set in prepareLine
+    assert m._prepared is True
+    m.moveLine()
+    tail = t.writes[len(prep):]
+    # prepared moveLine: no re-positioning, no VEL? re-read
+    assert tail[0] == "1MVA1.0\r"
+    assert "1VEL?\r" not in tail and "1MVA-1.0\r" not in tail
+    assert tail[-1] == "1VEL1.0\r"  # cruise restored last
+    assert m._prepared is False
+
+
+def test_move_line_unprepared_is_self_contained():
+    # Without prepareLine, moveLine still does the full sequence itself.
+    m, t = make_motor(replies=["#0,1.000000\n", "#8\n", "#8\n"])
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0
+    m.update_trajectory()
+    m.moveLine()
+    w = t.writes
+    assert w[1] == "1VEL?\r"
+    assert "1MVA-1.0\r" in w
+    assert w.index("1VEL1.0\r") < w.index("1MVA1.0\r")
+    assert w[-1] == "1VEL1.0\r"
+
+
+def test_move_line_velocity_restore_failure_does_not_mask_error():
+    from pystxmcontrol.drivers.mmcController import MMCError
+    m, t = make_motor(replies=["#0,1.000000\n", "#8\n"])
+    m.trajectory_start = (-1.0, 0.0)
+    m.trajectory_stop = (1.0, 0.0)
+    m.trajectory_pixel_count = 20
+    m.trajectory_pixel_dwell = 100.0
+    m.update_trajectory()
+    m.prepareLine()
+    # after prepare, make the line's STA? polls report "moving" forever,
+    # and make the finally-block restore itself fail too.
+    m.config["timeout"] = 0.05
+
+    def boom(velocity):
+        raise IOError("link dropped")
+    m.setAxisParams = boom
+    t.replies = ["#1\n"] * 10000
+    # deadline is >= 5 s; shrink line time to keep the test fast by faking
+    # the status as an immediate stall via deadline: use tiny dwell and
+    # monkeypatch time is overkill -- instead exercise via getStatus raising.
+    def bad_status(**kwargs):
+        raise MMCError("garbled STA? reply")
+    m.getStatus = bad_status
+    with pytest.raises(MMCError, match="garbled STA"):
+        m.moveLine()  # restore failure is logged, original error surfaces
+    assert m._prepared is False
+
+
 def test_move_line_simulation_lands_on_stop():
     from pystxmcontrol.drivers.mmcController import mmcController
     from pystxmcontrol.drivers.mmcMotor import mmcMotor

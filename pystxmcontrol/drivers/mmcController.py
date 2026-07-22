@@ -6,6 +6,8 @@ Transaction layer only: framing (axis prefix + CR), response parsing
 No locking here -- the IOC layer's per-controller io_lock serializes all
 link I/O (see pystxmcontrol.iocs.base.MotorRecordGroup).
 """
+import socket
+
 from pystxmcontrol.controller.hardwareController import hardwareController
 
 
@@ -17,7 +19,6 @@ class _TcpLineTransport:
     """Line-oriented TCP transport matching pyserial's write/readline API."""
 
     def __init__(self, host, port, timeout=1.0):
-        import socket
         self._sock = socket.create_connection((host, int(port)), timeout=timeout)
         self._sock.settimeout(timeout)
         self._file = self._sock.makefile("rb")
@@ -26,7 +27,6 @@ class _TcpLineTransport:
         self._sock.sendall(data)
 
     def readline(self) -> bytes:
-        import socket
         try:
             return self._file.readline()
         except socket.timeout:

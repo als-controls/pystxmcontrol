@@ -241,6 +241,25 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                 # shutter only decides real counts vs. darks -- it never affects
                 # line completion.
 
+                def _setup_trajectory():
+                    # Caller must hold self._io_lock.
+                    # Hold the perpendicular axis at its current position;
+                    # 2D (x, y) trajectory drivers (e.g. nptMotor) infer
+                    # the fast axis from whichever slot varies.
+                    perp = (other_motor.getPos()
+                            if other_motor is not None
+                            and hasattr(other_motor, "getPos") else 0.0)
+                    motor.trajectory_pixel_count = n
+                    motor.trajectory_pixel_dwell = dwell
+                    motor.lineMode = "continuous"
+                    if axis_label == "y":
+                        motor.trajectory_start = (perp, x0)
+                        motor.trajectory_stop = (perp, x1)
+                    else:
+                        motor.trajectory_start = (x0, perp)
+                        motor.trajectory_stop = (x1, perp)
+                    motor.update_trajectory()
+
                 def _run_line():
                     # All motor-side I/O for the line runs here, in one worker
                     # thread holding the controller lock, so it never
@@ -248,22 +267,21 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                     # axis) on the shared link. Drivers stay lock-agnostic, so
                     # calling their methods under the lock can't self-deadlock.
                     with self._io_lock:
-                        # Hold the perpendicular axis at its current position;
-                        # 2D (x, y) trajectory drivers (e.g. nptMotor) infer
-                        # the fast axis from whichever slot varies.
-                        perp = (other_motor.getPos()
-                                if other_motor is not None
-                                and hasattr(other_motor, "getPos") else 0.0)
-                        motor.trajectory_pixel_count = n
-                        motor.trajectory_pixel_dwell = dwell
-                        motor.lineMode = "continuous"
-                        if axis_label == "y":
-                            motor.trajectory_start = (perp, x0)
-                            motor.trajectory_stop = (perp, x1)
-                        else:
-                            motor.trajectory_start = (x0, perp)
-                            motor.trajectory_stop = (x1, perp)
-                        motor.update_trajectory()
+                        _setup_trajectory()
+                        motor.moveLine()
+
+                def _prepare_line():
+                    # Free-run (non-EXT) trigger path only: trajectory setup
+                    # + pre-positioning (move to line start, set line
+                    # velocity) BEFORE the DAQ is armed, since initLine
+                    # starts acquisition immediately for an IMM trigger.
+                    with self._io_lock:
+                        _setup_trajectory()
+                        motor.prepareLine()
+
+                def _run_prepared_line():
+                    # Free-run path: only the constant-velocity move remains.
+                    with self._io_lock:
                         motor.moveLine()
 
                 async def _close_beam():
@@ -291,20 +309,32 @@ def _fly_group_class(axis_labels: list, daq_keys: list):
                     stage["name"] = "config"
                     # Trigger source is a driver capability: motors with no
                     # hardware trigger output (e.g. MMC) declare
-                    # line_trigger = "INT" and the DAQ free-runs during the
-                    # line; absent attribute keeps the EXT line-start
-                    # trigger contract (nPoint, E712).
+                    # line_trigger = "IMM" (53230A immediate/free-run
+                    # trigger) and the DAQ free-runs during the line; absent
+                    # attribute keeps the EXT line-start trigger contract
+                    # (nPoint, E712).
                     line_trigger = getattr(motor, "line_trigger", "EXT")
                     await loop.run_in_executor(None, functools.partial(
                         daq.config, dwell, count=1, samples=n,
                         trigger=line_trigger))
+                    if line_trigger != "EXT":
+                        # Free-run: initLine (INIT:IMM) starts acquisition
+                        # immediately, so all pre-positioning (move to line
+                        # start, set line velocity) must happen BEFORE the
+                        # arm. Runs inside this task so the caller's
+                        # deadline/abort guard covers a stall here too.
+                        stage["name"] = "prepare"
+                        await loop.run_in_executor(None, _prepare_line)
                     stage["name"] = "arm"
                     await loop.run_in_executor(None, daq.initLine)
                     stage["name"] = "beam_open"
                     await loop.run_in_executor(None, self._command_shutters, "OPEN")
                     try:
                         stage["name"] = "move"
-                        await loop.run_in_executor(None, _run_line)
+                        await loop.run_in_executor(
+                            None,
+                            _run_prepared_line if line_trigger != "EXT"
+                            else _run_line)
                     finally:
                         await _close_beam()
                     stage["name"] = "read"

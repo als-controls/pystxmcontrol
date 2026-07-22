@@ -2,7 +2,7 @@
 """Micronix MMC axis driver (point-to-point + constant-velocity fly lines).
 
 Lock-agnostic: the IOC layer's per-controller io_lock serializes all link
-I/O. Software-timed fly lines (line_trigger = "INT"): the MMC has no
+I/O. Software-timed fly lines (line_trigger = "IMM"): the MMC has no
 trigger output, so the DAQ free-runs during the constant-velocity move.
 """
 import time
@@ -18,7 +18,9 @@ class mmcMotor(motor):
 
     #: DAQ trigger source for fly lines (fly_ioc reads this; the MMC has no
     #: hardware trigger output, so lines are software-timed by default).
-    line_trigger = "INT"
+    #: "IMM" is the 53230A TRIG:SOUR mnemonic for an immediate/internal
+    #: (free-run) trigger; the instrument accepts IMM|EXT|BUS only.
+    line_trigger = "IMM"
 
     def __init__(self, controller=None, config=None):
         self.controller = controller
@@ -39,6 +41,9 @@ class mmcMotor(motor):
         self._line_start = 0.0
         self._line_stop = 0.0
         self._poll = 0.005
+        # prepareLine()/moveLine() split state (see prepareLine docstring)
+        self._prepared = False
+        self._cruise_velocity = 0.0
 
     # ---- helpers -------------------------------------------------------
     def _to_controller(self, pos):
@@ -150,6 +155,8 @@ class mmcMotor(motor):
             start, stop = y0, y1
         if direction == "backward":
             start, stop = stop, start
+        if stop == start:
+            raise MMCError("fly line has zero span (start == stop)")
         line_time = self.trajectory_pixel_count * self.trajectory_pixel_dwell / 1000.0
         if line_time <= 0:
             raise MMCError("fly line has non-positive duration")
@@ -163,19 +170,45 @@ class mmcMotor(motor):
         self.line_velocity = velocity
         self.npositions = self.trajectory_pixel_count
 
+    def prepareLine(self):
+        """Pre-position for a fly line WITHOUT starting it.
+
+        Splits moveLine so fly_ioc can pre-position before arming the DAQ:
+        with an IMM (free-run) trigger, initLine starts acquisition
+        immediately, so the (blocking) move to the line start must happen
+        first. Stashes the cruise velocity, moves to the line start, and
+        sets the line velocity; a following moveLine() then only issues the
+        constant-velocity move. Runs under fly_ioc's io_lock in an executor
+        thread.
+        """
+        if self.simulation:
+            self._prepared = True
+            return
+        self._cruise_velocity = self.get_velocity()
+        self.moveTo(self._line_start)
+        self.setAxisParams(velocity=self.line_velocity)
+        self._prepared = True
+
     def moveLine(self, **kwargs):
         """Blocking constant-velocity line move (runs under fly_ioc's
         io_lock in an executor thread). DAQ acquisition free-runs
-        concurrently (line_trigger = "INT")."""
+        concurrently (line_trigger = "IMM").
+
+        Self-contained when called cold; after prepareLine() it skips the
+        re-positioning/velocity setup and only commands the line move."""
         line_time = self.trajectory_pixel_count * self.trajectory_pixel_dwell / 1000.0
         if self.simulation:
+            self._prepared = False
             time.sleep(min(line_time, 0.1))
             self.controller.positions[self._axis] = \
                 (self._line_stop - self.config["offset"]) / self.config["units"]
             return
-        cruise = self.get_velocity()
-        self.moveTo(self._line_start)
-        self.setAxisParams(velocity=self.line_velocity)
+        if self._prepared:
+            cruise = self._cruise_velocity
+        else:
+            cruise = self.get_velocity()
+            self.moveTo(self._line_start)
+            self.setAxisParams(velocity=self.line_velocity)
         try:
             self.controller.command(
                 self._axis, f"MVA{self._to_controller(self._line_stop)}")
@@ -188,4 +221,10 @@ class mmcMotor(motor):
                         f"(no completion within {line_time * 4 + 5:.1f}s)")
                 time.sleep(self._poll)
         finally:
-            self.setAxisParams(velocity=cruise)
+            self._prepared = False
+            try:
+                self.setAxisParams(velocity=cruise)
+            except Exception as e:
+                # Never mask the original line error with a restore failure.
+                print(f"MMC axis {self.axis}: cruise velocity restore "
+                      f"failed: {e}", flush=True)
