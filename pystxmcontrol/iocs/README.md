@@ -71,6 +71,24 @@ When an E712 controller is present, the supervisor creates one E712 IOC with a F
 | `:INDEX` | RO | **Line index.** Increments by 1 after each completed line. **Consistency contract:** clients MUST monitor `:INDEX`; when it increments, all `:DATA:*` and `:POS` waveforms for that line are already written in full. |
 | `:DATA:{key}` | RO | **DAQ waveform** for detector `key` (one per DAQ). Read-only; updated by the FLY loop each line. Data is only valid after `:INDEX` increments. |
 
+### Fly-Capable Controllers
+
+The following controllers are supported for continuous fly-line scanning:
+
+- `e712Controller` (Physik Instrumente E-712): trigger-synchronized fly lines.
+  The E712 outputs a trigger pulse per point, enabling zero-skew DAQ
+  synchronization via `line_trigger = "EXT"` (hardware-timed, low-latency).
+
+- `nptController` (Newport MM-3000): constant-velocity software-timed fly lines.
+  The nptController supports velocity profile upload; DAQ is typically
+  free-run (external trigger not available on legacy serial models).
+
+- `mmcController` (Micronix MMC): constant-velocity software-timed fly lines.
+  The MMC has no trigger output, so `mmcMotor.line_trigger = "INT"` makes the
+  DAQ free-run during the line (start-skew of a few ms; positions are nominal
+  `linspace`). Transport is serial (`COM*`/`/dev/tty*`, 38400 8N1) or TCP
+  (`address` + nonzero `port`), chosen from the address format.
+
 ### DAQ Group (Keysight Counter Family)
 
 Standalone DAQ IOCs (if no E712 group exists) expose a DaqGroup at `STXM{station}:DAQ_{daq_key}.*`:
