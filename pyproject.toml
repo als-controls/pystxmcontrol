@@ -50,6 +50,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+iocs = ["caproto>=1.1"]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
@@ -79,6 +80,7 @@ Repository = "https://github.com/davidalexandershapiro/pystxmcontrol.git"
 stxmcontrol = "pystxmcontrol.gui.main:main"
 stxmserver = "pystxmcontrol.controller.server:main"
 stxmcontrol-remote = "pystxmcontrol.remote.app:main"
+stxm-iocs = "pystxmcontrol.iocs.supervisor:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -112,4 +114,5 @@ warn_unused_configs = true
 disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 asyncio_mode = "auto"
