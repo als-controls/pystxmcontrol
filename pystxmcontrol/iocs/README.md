@@ -76,7 +76,7 @@ The FLY IOC acts as a **CA client** of the standalone DAQ IOCs (see [DAQ Service
 6. Once all DAQs have incremented, the FLY IOC reads each DAQ's `:COUNTS:WF` via CA.
 7. The FLY IOC increments its own `:INDEX`, signaling that `:POS` and all `:DATA:*` cache the completed line.
 
-**Shared Detector Contention:** Any number of fly-capable controllers (E712, nPoint, Micronix) may share the same detector set. When one controller's FLY loop arms all DAQs and holds them through to line completion, a second controller's concurrent ARM attempt will be **rejected by the DAQ IOC** with `:LINE:ERROR = "ARM rejected: line in progress"`. The second controller's client loop must back off (re-read `:LINE:ERROR` after ARM to detect rejection) and retry after the first line completes.
+**Shared Detector Contention:** Any number of fly-capable controllers (E712, nPoint, Micronix) may share the same detector set. When one controller's FLY loop arms all DAQs and holds them through to line completion, a second controller's concurrent ARM attempt will be **rejected by the DAQ IOC** with `:LINE:ERROR = "ARM rejected: line in progress"`. The second controller's FLY loop does not retry: it fails the line fast with an arm-rejection error, surfacing the contention to its own client immediately rather than blocking to wait out the first line.
 
 **PV Summary (FLY Orchestration):**
 
@@ -145,7 +145,7 @@ When a fly IOC or other external client initiates a line acquisition, it perform
 
 **Contention Rejection:** If a second client attempts to ARM while a line is in progress, the DAQ IOC rejects it by setting `:LINE:ERROR` to `"ARM rejected: line in progress"` and leaving `:LINE:STATUS` unchanged. Clients detect contention by reading `:LINE:ERROR` immediately after an ARM put.
 
-**Watchdog Auto-Disarm:** The DAQ service runs an internal watchdog timer set to `max(5 s, 4 * NPOINTS * DWELL / 1000 + 5 s)`. If no completion signal is received within this time, the DAQ IOC automatically disarms and sets `:LINE:ERROR` to `"Line timeout; armed state cleared"`. This prevents deadlock if the external trigger source fails.
+**Watchdog Auto-Disarm:** The DAQ service runs an internal watchdog timer set to `max(5 s, 4 * NPOINTS * DWELL / 1000 + 5 s)`. If no completion signal is received within this time, the DAQ IOC automatically disarms (`:LINE:STATUS` -> `ERROR`) and sets `:LINE:ERROR` to `"line watchdog: no data within {watchdog:.1f}s; auto-disarmed"`. This prevents deadlock if the external trigger source fails.
 
 **PV Summary (Line Mode):**
 
@@ -153,12 +153,12 @@ When a fly IOC or other external client initiates a line acquisition, it perform
 |----|-----|-----------|
 | `:LINE:NPOINTS` | RW | Number of points to acquire in the line (1 to hardware max). |
 | `:LINE:TRIGGER` | RW | Trigger source enum: `EXT` (hardware trigger line), `IMM` (immediate, arm-to-start), or `BUS` (software bus trigger). |
-| `:LINE:ARM` | RW | Write 1 to arm for a line. Put-completion waits for `:LINE:STATUS` to reach `ARMED`. Rejects if status is already `ACQUIRING` or `ERROR`. |
+| `:LINE:ARM` | RW | Write 1 to arm for a line. Put-completion waits for `:LINE:STATUS` to reach `ARMED`. Rejection is busy-based (an in-flight line or point acquire); status of `ERROR` alone does not reject an ARM. |
 | `:LINE:INDEX` | RO | Increments by 1 when a line completes; **consistency contract:** when `:LINE:INDEX` changes, `:COUNTS:WF` is fully written and consistent. Clients MUST monitor `:LINE:INDEX` to synchronize waveform reads. |
 | `:LINE:ABORT` | RW | Write 1 to stop acquisition immediately. Sets `:LINE:STATUS` to `IDLE` and clears any pending completion. |
 | `:LINE:STATUS` | RO | Line state: `IDLE`, `ARMED`, `ACQUIRING`, or `ERROR`. |
 | `:LINE:ERROR` | RO | Error message (up to 256 chars) if status is `ERROR`; e.g., `"ARM rejected: line in progress"` or `"Line timeout; armed state cleared"`. |
-| `:COUNTS:WF` | RO | Counts waveform (length = NPOINTS), updated atomically when a line completes (after `:LINE:INDEX` increments). |
+| `:COUNTS:WF` | RO | Counts waveform (length = NPOINTS), written when a line completes, immediately before `:LINE:INDEX` increments. |
 
 ### Shutter/Gate Group
 
