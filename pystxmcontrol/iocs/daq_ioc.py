@@ -59,6 +59,7 @@ class DaqGroup(PVGroup):
         self._started = False
         self._line_task = None
         self._line_starting = False
+        self._point_busy = False
 
     async def _ensure_started(self):
         if not self._started:
@@ -80,6 +81,9 @@ class DaqGroup(PVGroup):
     def _line_busy(self) -> bool:
         return self._line_starting or (self._line_task is not None and not self._line_task.done())
 
+    def _point_acquire_busy(self) -> bool:
+        return self._point_busy
+
     @line_arm.putter
     async def line_arm(self, instance, value):
         if not value:
@@ -89,6 +93,9 @@ class DaqGroup(PVGroup):
             # client does not resolve put futures on ErrorResponse, so a
             # raised rejection would hang the caller until its timeout.
             await self.line_error.write("ARM rejected: line in progress")
+            return 0
+        if self._point_acquire_busy():
+            await self.line_error.write("ARM rejected: point acquire in progress")
             return 0
         n = int(self.line_npoints.value)
         dwell = float(self.dwell.value)
@@ -105,21 +112,29 @@ class DaqGroup(PVGroup):
         # concurrent ARM puts both pass _line_busy() check but both spawn tasks.
         self._line_starting = True
         try:
-            await self._ensure_started()
-            loop = asyncio.get_running_loop()
-            trigger = _enum_str(self.line_trigger)
-            if self._daq.simulation:
-                # sim contract (matches the old in-process fly path): the sim
-                # keysight generates count*samples poisson points after sleeping
-                # dwell*count*samples.
-                cfg = functools.partial(self._daq.config, dwell, count=n, samples=1)
-            else:
-                # hardware line-trigger contract: one trigger event, n samples.
-                cfg = functools.partial(self._daq.config, dwell, count=1,
-                                        samples=n, trigger=trigger)
-            await loop.run_in_executor(None, cfg)
-            if not self._daq.simulation:
-                await loop.run_in_executor(None, self._daq.initLine)
+            try:
+                await self._ensure_started()
+                loop = asyncio.get_running_loop()
+                trigger = _enum_str(self.line_trigger)
+                if self._daq.simulation:
+                    # sim contract (matches the old in-process fly path): the sim
+                    # keysight generates count*samples poisson points after sleeping
+                    # dwell*count*samples.
+                    cfg = functools.partial(self._daq.config, dwell, count=n, samples=1)
+                else:
+                    # hardware line-trigger contract: one trigger event, n samples.
+                    cfg = functools.partial(self._daq.config, dwell, count=1,
+                                            samples=n, trigger=trigger)
+                await loop.run_in_executor(None, cfg)
+                if not self._daq.simulation:
+                    await loop.run_in_executor(None, self._daq.initLine)
+            except Exception as exc:
+                # Arm-setup exceptions (_ensure_started/config/initLine) must
+                # not propagate out of the putter: an opaque put timeout is
+                # far worse for the client than a reported ERROR status.
+                await self.line_status.write("ERROR")
+                await self.line_error.write(f"arm failed: {exc}"[:255])
+                return 0
             await self.line_error.write("")
             await self.line_status.write("ARMED")
             # Spawned AFTER arming succeeds; the ARM put's completion is the
@@ -164,7 +179,17 @@ class DaqGroup(PVGroup):
 
     @line_abort.putter
     async def line_abort(self, instance, value):
-        if value and self._line_busy():
+        if not value:
+            return 0
+        if self._line_starting:
+            # An arm is mid-flight (setup awaits not yet resolved); there is
+            # no task to cancel yet and self._line_task may still hold a
+            # stale, already-done task from a previous line. Reject honestly
+            # rather than cancelling the wrong thing or crashing on a race
+            # against _line_task being reset to None.
+            await self.line_error.write("ABORT ignored: arm in progress; retry")
+            return 0
+        if self._line_task is not None and not self._line_task.done():
             self._line_task.cancel()
             try:
                 await self._line_task
@@ -182,15 +207,22 @@ class DaqGroup(PVGroup):
         if self._line_busy():
             await self.line_error.write("ACQUIRE rejected: line in progress")
             return 0
-        await self._ensure_started()
-        loop = asyncio.get_running_loop()
-        dwell_ms = self.dwell.value
-        await loop.run_in_executor(
-            None, functools.partial(self._daq.config, dwell_ms, count=1, samples=1))
-        data = await self._daq.getPoint()  # coroutine on OUR loop
-        c = float(data[0])
-        await self.counts.write(c)
-        await self.rate.write(c / (dwell_ms / 1000.0) if dwell_ms else 0.0)
+        # Set synchronous busy flag BEFORE any await so a concurrent LINE:ARM
+        # put (which checks this flag) cannot race past it and clobber the
+        # point read via config().
+        self._point_busy = True
+        try:
+            await self._ensure_started()
+            loop = asyncio.get_running_loop()
+            dwell_ms = self.dwell.value
+            await loop.run_in_executor(
+                None, functools.partial(self._daq.config, dwell_ms, count=1, samples=1))
+            data = await self._daq.getPoint()  # coroutine on OUR loop
+            c = float(data[0])
+            await self.counts.write(c)
+            await self.rate.write(c / (dwell_ms / 1000.0) if dwell_ms else 0.0)
+        finally:
+            self._point_busy = False
         return 0
 
     async def write_line(self, line) -> None:

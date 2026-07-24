@@ -176,6 +176,79 @@ def test_daq_client_arm_raises_on_busy_rejection(daq_service):
         abort.write(1, wait=True, timeout=15)
 
 
+def test_abort_with_nothing_armed_is_harmless_noop(daq_service):
+    # ABORT before anything has ever been armed must not raise AttributeError
+    # (self._line_task is None) and must leave status untouched.
+    _, ctx = daq_service
+    abort, status = _pvs(ctx, "LINE:ABORT", "LINE:STATUS")
+    before = status.read().data[0]
+    result = abort.write(1, wait=True, timeout=15)  # must complete, not hang
+    assert result is not None
+    assert status.read().data[0] == before
+
+
+def test_abort_during_arm_in_progress_is_rejected(daq_service):
+    # ABORT racing the arm-setup window (self._line_starting True, before
+    # self._line_task is assigned) must not crash and must not lie IDLE
+    # while the new arm proceeds; it should report a clear rejection.
+    harness, ctx = daq_service
+    npts, dwell, err = _pvs(ctx, "LINE:NPOINTS", "DWELL", "LINE:ERROR")
+    npts.write(25, wait=True)
+    dwell.write(1.0, wait=True)
+
+    group = harness._daq_group
+    group._line_starting = True
+    try:
+        abort, = _pvs(ctx, "LINE:ABORT")
+        abort.write(1, wait=True, timeout=15)
+        assert "ABORT ignored" in _read_str(err)
+    finally:
+        group._line_starting = False
+
+
+def test_point_busy_rejects_concurrent_arm(daq_service):
+    # A LINE:ARM arriving while a point ACQUIRE is in flight must be
+    # rejected, not allowed to clobber the point read via config().
+    harness, ctx = daq_service
+    npts, dwell, arm, err = _pvs(
+        ctx, "LINE:NPOINTS", "DWELL", "LINE:ARM", "LINE:ERROR")
+    npts.write(10, wait=True)
+    dwell.write(1.0, wait=True)
+
+    group = harness._daq_group
+    group._point_busy = True
+    try:
+        arm.write(1, wait=True, timeout=15)
+        assert "ARM rejected: point acquire in progress" in _read_str(err)
+    finally:
+        group._point_busy = False
+
+
+def test_arm_setup_exception_reports_error_not_timeout(daq_service):
+    # An exception raised during arm-setup (config/initLine/_ensure_started)
+    # must not propagate out of the putter -- it must resolve the put
+    # promptly with STATUS=ERROR and a descriptive message.
+    harness, ctx = daq_service
+    npts, dwell, arm, status, err = _pvs(
+        ctx, "LINE:NPOINTS", "DWELL", "LINE:ARM", "LINE:STATUS", "LINE:ERROR")
+    npts.write(10, wait=True)
+    dwell.write(1.0, wait=True)
+
+    group = harness._daq_group
+    original_config = group._daq.config
+
+    def raise_config(*args, **kwargs):
+        raise RuntimeError("simulated config failure")
+
+    group._daq.config = raise_config
+    try:
+        arm.write(1, wait=True, timeout=15)  # must complete promptly
+        assert status.read().data[0] == 3    # ERROR
+        assert "arm failed: simulated config failure" in _read_str(err)
+    finally:
+        group._daq.config = original_config
+
+
 def test_busy_guard_prevents_concurrent_arms(daq_service):
     # Verify the _line_starting guard is present and set before awaits
     harness, _ = daq_service
