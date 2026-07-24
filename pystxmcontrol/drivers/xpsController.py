@@ -1,186 +1,172 @@
-import socket, time, threading
+"""Newport XPS controller driver (TCP, port 5001).
+
+Structure-only rewrite of David's driver: same XPS function calls, same
+dual-socket flow (control socket for motion/parameter commands, monitor
+socket for position polling), same disable/enable abort. What changed is
+code structure: ONE framing/parsing site (_transact) with typed XPSError
+(no [-2, ''] sentinels, no eval()), lock-agnostic (the IOC layer's
+io_lock serializes), and a working simulation mode.
+
+Known device-interaction quirks are deliberately preserved -- see the
+spec's "Itemized device-interaction weaknesses"
+(docs/superpowers/specs/2026-07-24-xps-fly-integration-design.md).
+"""
+import socket
+import time
+
 from pystxmcontrol.controller.hardwareController import hardwareController
 
+
+class XPSError(IOError):
+    """Socket failure, malformed reply, or nonzero XPS error code."""
+
+
 class xpsController(hardwareController):
-    def __init__(self, address = '192.168.168.253', port = 5001, simulation = False):
+
+    def __init__(self, address="192.168.168.253", port=5001, simulation=False):
         self.address = address
-        self.port = port
+        self.port = int(port) if port else 5001
         self.simulation = simulation
-        self.stopped = False
-        self.moving = False
-        self.position = 0. #used for simulation mode
-        self._nSockets = 0
-        self._sockets = []
-        self._timeout = 5.
-        self._position_tolerance = 5.0
-        # One lock per socket so each send+receive transaction is atomic on its own socket.
-        # A global lock would scramble replies between concurrent readers on a shared socket
-        # (only the send was locked before), and locking everything together would block
-        # monitorSocket reads during a controlSocket move.  Per-socket locks fix both.
-        self._socket_locks = []
+        self._control = None   # motion commands, SGamma set, disable/enable
+        self._monitor = None   # position queries during moves
+        # Simulation state shared by all xpsMotor instances:
+        self.positions = {}    # group -> position (controller units)
+        self.sgamma = {}       # positioner -> [vel, accel, minJerk, maxJerk]
 
-    def initialize(self, simulation = False):
+    def initialize(self, simulation=False):
         self.simulation = simulation
-        if not(self.simulation):
-            print("Connecting to XPS controller...", self.address, self.port)
-            self.controlSocket = self.connect(self.address, self.port, 1)
-            self.monitorSocket = self.connect(self.address, self.port, 1)
+        if self.simulation:
+            return
+        print(f"Connecting to XPS controller on {self.address}:{self.port}",
+              flush=True)
+        self._control = self._open_socket()
+        self._monitor = self._open_socket()
 
-    def __sendAndReceive(self, socketId, command):
+    def _open_socket(self):
         try:
-            # Hold the per-socket lock for the WHOLE transaction (send + the full recv loop)
-            # so a concurrent caller on the same socket cannot read this request's reply.
-            # Different sockets use different locks, so a move on controlSocket does not block
-            # position reads on monitorSocket.
-            with self._socket_locks[socketId]:
-                self._sockets[socketId].send(command.encode())
-                response = self._sockets[socketId].recv(1024).decode()
-                while (response.find(',EndOfAPI') == -1):
-                    response += self._sockets[socketId].recv(1024)
+            sock = socket.create_connection((str(self.address), self.port),
+                                            timeout=5.0)
+        except OSError as exc:
+            raise XPSError(
+                f"failed to connect to XPS on {self.address}:{self.port}: {exc}")
+        sock.settimeout(1.0)
+        return sock
+
+    # ---- framing/parsing: the ONE place XPS wire format lives ----------
+    def _transact(self, sock, command, timeout=None) -> str:
+        """Send a command and read its full ``err,payload,EndOfAPI`` reply.
+
+        Raises XPSError on socket error/timeout, malformed reply, or a
+        nonzero XPS error code. ``timeout`` temporarily overrides the
+        socket timeout for this transaction.
+        """
+        if self.simulation:
+            raise XPSError("_transact has no meaning in simulation mode")
+        old = sock.gettimeout()
+        if timeout is not None:
+            sock.settimeout(timeout)
+        try:
+            sock.send(command.encode())
+            response = ""
+            while ",EndOfAPI" not in response:
+                chunk = sock.recv(1024).decode(errors="replace")
+                if not chunk:
+                    raise XPSError(f"connection closed during {command!r}")
+                response += chunk
         except socket.timeout:
-            return [-2, '']
-        except socket.error as errString:
-            print( 'Socket error : ' + errString)
-            return [-2, '']
-        for i in range(len(response)):
-            if (response[i] == ','):
-                return [int(response[0:i]), response[i+1:-9]]
-
-    def connect(self, IP, port, timeOut):
-        self._nSockets = len(self._sockets)
-        socketId = self._nSockets
+            raise XPSError(f"timeout waiting for reply to {command!r}")
+        except OSError as exc:
+            raise XPSError(f"socket error during {command!r}: {exc}")
+        finally:
+            if timeout is not None:
+                sock.settimeout(old)
+        err_str, _, rest = response.partition(",")
+        payload = rest[: rest.rfind(",EndOfAPI")] if rest.rfind(",EndOfAPI") >= 0 \
+            else rest[: rest.rfind("EndOfAPI")]
         try:
-            self._sockets.append(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
-            self._socket_locks.append(threading.Lock())   # keep locks index-aligned with sockets
-            self._sockets[socketId].connect((IP, port))
-            self._sockets[socketId].settimeout(timeOut)
-            self._sockets[socketId].setblocking(1)
-        except socket.error:
-            print("Failed to connect to XPS controller on: %s:%s" %(self.address, self.port))
-            return -1
-        return socketId
+            err = int(err_str)
+        except ValueError:
+            raise XPSError(f"malformed XPS reply to {command!r}: {response!r}")
+        if err != 0:
+            raise XPSError(f"XPS error {err} for {command!r}: {payload!r}")
+        return payload
 
-    def abortMove(self, socketId, motor):
-        self.disable_axis(socketId, motor)
+    # ---- protocol wrappers (legacy XPS function set, unchanged) ---------
+    def move_relative(self, group, displacement):
+        """Fire GroupMoveRelative on the control socket.
+
+        David's flow: the XPS answers a motion command only when the move
+        COMPLETES, so we attempt a short (socket-default 1 s) reply read --
+        an immediate error reply (e.g. group disabled) surfaces as
+        XPSError, while a read timeout means "move in progress" and is
+        swallowed; completion is polled via get_position on the monitor
+        socket by the motor. (Spec weakness #6: the eventual reply is left
+        unread; the next control-socket _transact may need to tolerate it
+        -- preserved behavior.)
+        """
+        if self.simulation:
+            self.positions[group] = self.positions.get(group, 0.0) + displacement
+            return
+        try:
+            self._transact(self._control,
+                           f"GroupMoveRelative({group},{displacement})")
+        except XPSError as exc:
+            if "timeout waiting for reply" in str(exc):
+                return  # move in progress; completion is polled
+            raise
+
+    def get_position(self, group) -> float:
+        if self.simulation:
+            return self.positions.get(group, 0.0)
+        payload = self._transact(
+            self._monitor, f"GroupPositionCurrentGet({group},double *)")
+        try:
+            return float(payload.split(",")[0])
+        except ValueError:
+            raise XPSError(f"unparseable position payload {payload!r}")
+
+    def get_sgamma(self, positioner) -> list:
+        if self.simulation:
+            return list(self.sgamma.get(positioner, [10.0, 80.0, 0.02, 0.04]))
+        payload = self._transact(
+            self._control,
+            f"PositionerSGammaParametersGet({positioner},double *,double *,"
+            f"double *,double *)")
+        try:
+            values = [float(v) for v in payload.split(",")]
+        except ValueError:
+            raise XPSError(f"unparseable SGamma payload {payload!r}")
+        if len(values) != 4:
+            raise XPSError(f"expected 4 SGamma values, got {payload!r}")
+        return values
+
+    def set_sgamma(self, positioner, velocity, acceleration, min_jerk, max_jerk):
+        if self.simulation:
+            self.sgamma[positioner] = [float(velocity), float(acceleration),
+                                       float(min_jerk), float(max_jerk)]
+            return
+        self._transact(
+            self._control,
+            f"PositionerSGammaParametersSet({positioner},{velocity},"
+            f"{acceleration},{min_jerk},{max_jerk})")
+
+    def disable_group(self, group):
+        if not self.simulation:
+            self._transact(self._control, f"GroupMotionDisable({group})")
+
+    def enable_group(self, group):
+        if not self.simulation:
+            self._transact(self._control, f"GroupMotionEnable({group})")
+
+    def abort_move(self, group):
+        """David's abort: disable, 1 s, enable, 1 s. (Spec weakness #1:
+        GroupMoveAbort is the candidate improvement -- NOT used yet.)"""
+        self.disable_group(group)
         time.sleep(1)
-        self.enable_axis(socketId, motor)
+        self.enable_group(group)
         time.sleep(1)
 
-    def moveTo(self, socketId, motor, target, timeout, use_relative = True):
-        self._timeout = timeout
-        err, currentPos = self.getPosition(socketId, motor)
-        if use_relative:
-            #An XPS can get in a state where absolute moves are inaccurate.  Use Relative moves instead.
-            [err, retString] = self.moveRelative(socketId,motor,target,target-currentPos)
-            return [err, retString]
-        else:
-            command = f"GroupMoveAbsolute({motor},{target})"
-            self.moving = True
-            [err, retString] = self.__sendAndReceive(socketId, command)
-            t0 = time.time()
-            while self.moving:
-                err,currentPos = self.getPosition(socketId, motor)
-                positionErr = target - currentPos
-                if abs(positionErr) > self._position_tolerance:
-                    if not(self.stopped):
-                        if (time.time() - t0) > self._timeout:
-                            print("XPS move timeout. Aborting...")
-                            self.moving = False
-                            self.abortMove(socketId, motor)
-                            return [err, retString]
-                        else:
-                            time.sleep(0.1)
-                    else:
-                        self.moving = False
-                        self.stopped = False
-                        return [err, retString]
-                else:
-                    self.moving = False
-                    return [err, retString]
 
-    def moveRelative(self, socketId,motor,target,displacement):
-        command = f"GroupMoveRelative({motor},{displacement})"
-        self.moving = True
-        [err, retString] = self.__sendAndReceive(socketId, command)
-        t0 = time.time()
-        while self.moving:
-            err,currentPos = self.getPosition(socketId, motor)
-            positionErr = target - currentPos
-            if abs(positionErr) > self._position_tolerance:
-                if not(self.stopped):
-                    if (time.time() - t0) > self._timeout:
-                        print("XPS move timeout. Aborting...")
-                        self.moving = False
-                        #return self.abortMove(socketId, motor)
-                        self.abortMove(socketId, motor)
-                        return [err, retString]
-                    else:
-                        time.sleep(0.1)
-                else:
-                    self.moving = False
-                    self.stopped = False
-                    return [err, retString]
-            else:
-                self.moving = False
-                return [err, retString]
-
-    def getPosition(self, socketId, motor):
-        command = 'GroupPositionCurrentGet(' + motor + ', double *)'
-        [err, retString] = self.__sendAndReceive(socketId, command)
-        if (err != 0):
-            print(err,retString)
-            return [err, float(retString)]
-        return [err, float(retString)]
-
-    def setParameters(self, socketId, motor, velocity, acceleration, minimumTjerkTime, maximumTjerkTime):
-        command = 'PositionerSGammaParametersSet(' + motor + ',' + str(velocity) + ',' + str(acceleration) + ',' + str(minimumTjerkTime) + ',' + str(maximumTjerkTime) + ')'
-        [err, retStr] = self.__sendAndReceive(socketId, command)
-        return [err, retStr]
-
-    def getParameters(self, socketId, motor):
-        command = 'PositionerSGammaParametersGet(' + motor + ',double *,double *,double *,double *)'
-        [err, retStr] = self.__sendAndReceive(socketId, command)
-        i, j, retList = 0, 0, [err]
-        for paramNb in range(4):
-            while ((i+j) < len(retStr) and retStr[i+j] != ','):
-                j += 1
-            retList.append(eval(retStr[i:i+j]))
-            i, j = i+j+1, 0
-        return retList
-
-    # GroupMotionDisable :  Set Motion disable on selected group
-    def disable_axis(self, socketId, axis):
-        command = f"GroupMotionDisable({axis})"
-        [error, returnedString] = self.__sendAndReceive(socketId, command)
-        return [error, returnedString]
-
-
-    # GroupMotionEnable :  Set Motion enable on selected group
-    def enable_axis(self, socketId, axis):
-        command = f"GroupMotionEnable({axis})"
-        [error, returnedString] = self.__sendAndReceive(socketId, command)
-        return [error, returnedString]
-    
-    # GPIOAnalogGet :  Read analog input or analog output for one or few input
-    def GPIOAnalogGet (self, socketId, GPIOName):
-        command = 'GPIOAnalogGet('
-        for i in range(len(GPIOName)):
-            if (i > 0):
-                command += ','
-            command += GPIOName[i] + ',' + 'double *'
-        command += ')'
-        return self._sendAndReceive(socketId, command)
-
-    # GPIOAnalogSet :  Set analog output for one or few output
-    def GPIOAnalogSet (self, socketId, GPIOName, AnalogOutputValue):
-        command = 'GPIOAnalogSet('
-        for i in range(len(GPIOName)):
-            if (i > 0):
-                command += ','
-            command += GPIOName[i] + ',' + str(AnalogOutputValue[i])
-        command += ')'
-        return self._sendAndReceive(socketId, command)
-
-
-
+# Make time accessible as a class attribute for monkeypatching in tests
+xpsController.time = time
 
