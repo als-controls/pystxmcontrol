@@ -58,6 +58,7 @@ class DaqGroup(PVGroup):
         self._entry = daq_entry
         self._started = False
         self._line_task = None
+        self._line_starting = False
 
     async def _ensure_started(self):
         if not self._started:
@@ -77,7 +78,7 @@ class DaqGroup(PVGroup):
         return value
 
     def _line_busy(self) -> bool:
-        return self._line_task is not None and not self._line_task.done()
+        return self._line_starting or (self._line_task is not None and not self._line_task.done())
 
     @line_arm.putter
     async def line_arm(self, instance, value):
@@ -100,26 +101,33 @@ class DaqGroup(PVGroup):
             await self.line_status.write("ERROR")
             await self.line_error.write("; ".join(problems)[:255])
             return 0
-        await self._ensure_started()
-        loop = asyncio.get_running_loop()
-        trigger = _enum_str(self.line_trigger)
-        if self._daq.simulation:
-            # sim contract (matches the old in-process fly path): the sim
-            # keysight generates count*samples poisson points after sleeping
-            # dwell*count*samples.
-            cfg = functools.partial(self._daq.config, dwell, count=n, samples=1)
-        else:
-            # hardware line-trigger contract: one trigger event, n samples.
-            cfg = functools.partial(self._daq.config, dwell, count=1,
-                                    samples=n, trigger=trigger)
-        await loop.run_in_executor(None, cfg)
-        if not self._daq.simulation:
-            await loop.run_in_executor(None, self._daq.initLine)
-        await self.line_error.write("")
-        await self.line_status.write("ARMED")
-        # Spawned AFTER arming succeeds; the ARM put's completion is the
-        # client's cue that it may command its motor move.
-        self._line_task = asyncio.create_task(self._acquire_line(n, dwell))
+        # Set synchronous busy flag BEFORE any await to prevent race where two
+        # concurrent ARM puts both pass _line_busy() check but both spawn tasks.
+        self._line_starting = True
+        try:
+            await self._ensure_started()
+            loop = asyncio.get_running_loop()
+            trigger = _enum_str(self.line_trigger)
+            if self._daq.simulation:
+                # sim contract (matches the old in-process fly path): the sim
+                # keysight generates count*samples poisson points after sleeping
+                # dwell*count*samples.
+                cfg = functools.partial(self._daq.config, dwell, count=n, samples=1)
+            else:
+                # hardware line-trigger contract: one trigger event, n samples.
+                cfg = functools.partial(self._daq.config, dwell, count=1,
+                                        samples=n, trigger=trigger)
+            await loop.run_in_executor(None, cfg)
+            if not self._daq.simulation:
+                await loop.run_in_executor(None, self._daq.initLine)
+            await self.line_error.write("")
+            await self.line_status.write("ARMED")
+            # Spawned AFTER arming succeeds; the ARM put's completion is the
+            # client's cue that it may command its motor move.
+            self._line_task = asyncio.create_task(self._acquire_line(n, dwell))
+        finally:
+            # Clear the starting flag now that the task is assigned or setup failed.
+            self._line_starting = False
         return 0
 
     async def _acquire_line(self, n: int, dwell: float):
@@ -137,9 +145,21 @@ class DaqGroup(PVGroup):
             await self.line_status.write("IDLE")
             await self.line_error.write("line aborted")
             raise
+        except Exception as exc:
+            # Catch any other exception (e.g., from getLine or write_line) and
+            # surface it so the client is not left waiting on a wedged detector.
+            await self.line_status.write("ERROR")
+            await self.line_error.write(str(exc)[:255])
+            return
         # ---- ordering contract: waveform FIRST, then INDEX ----
-        await self.write_line(line)
-        await self.line_index.write(self.line_index.value + 1)
+        try:
+            await self.write_line(line)
+            await self.line_index.write(self.line_index.value + 1)
+        except Exception as exc:
+            # Catch exceptions from write_line or index increment.
+            await self.line_status.write("ERROR")
+            await self.line_error.write(str(exc)[:255])
+            return
         await self.line_status.write("IDLE")
 
     @line_abort.putter

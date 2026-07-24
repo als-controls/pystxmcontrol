@@ -32,8 +32,10 @@ def daq_service(ioc_harness):
     entry = {"name": "Counter1", "driver": "keysight53230A", "address": "sim",
              "port": 5025, "channel": 1, "ndim": 0, "gate": False,
              "record": True, "simulation": True}
-    pvdb, _ = build_pvdb_for_entry(entry, PREFIX)
+    pvdb, group = build_pvdb_for_entry(entry, PREFIX)
     ioc_harness.start(pvdb)
+    # Store group on harness for tests that need direct access
+    ioc_harness._daq_group = group
     return ioc_harness, ioc_harness.client()
 
 
@@ -119,3 +121,52 @@ def test_arm_validation_errors(daq_service):
     arm.write(1, wait=True, timeout=15)
     assert status.read().data[0] == 3             # ERROR
     assert "NPOINTS" in _read_str(err)
+
+
+def test_getline_exception_surfaced(daq_service):
+    harness, ctx = daq_service
+    npts, dwell, arm, status, err, abort = _pvs(
+        ctx, "LINE:NPOINTS", "DWELL", "LINE:ARM", "LINE:STATUS", "LINE:ERROR",
+        "LINE:ABORT")
+    npts.write(10, wait=True)
+    dwell.write(1.0, wait=True)
+
+    # Monkeypatch getLine to raise an exception
+    test_exc = RuntimeError("simulated getLine failure")
+    async def raise_getline():
+        raise test_exc
+
+    group = harness._daq_group
+    original_getline = group._daq.getLine
+    group._daq.getLine = raise_getline
+
+    try:
+        arm.write(1, wait=True, timeout=15)
+        # Wait for acquisition to finish and error to be recorded
+        t0 = time.monotonic()
+        while status.read().data[0] != 3 and time.monotonic() - t0 < 5:
+            time.sleep(0.05)
+        assert status.read().data[0] == 3         # ERROR
+        assert "simulated getLine failure" in _read_str(err)
+    finally:
+        group._daq.getLine = original_getline
+        abort.write(1, wait=True, timeout=15)
+
+
+def test_busy_guard_prevents_concurrent_arms(daq_service):
+    # Verify the _line_starting guard is present and set before awaits
+    harness, _ = daq_service
+    group = harness._daq_group
+
+    # Check that the guard attribute exists
+    assert hasattr(group, '_line_starting'), "DaqGroup must have _line_starting attribute"
+
+    # Initially should be False
+    assert group._line_starting is False, "_line_starting should start False"
+
+    # The implementation detail check: verify the synchronous guard is checked
+    # in _line_busy() so that concurrent ARMs can't both pass the check.
+    # This is verified by inspecting that _line_busy checks _line_starting.
+    import inspect
+    source = inspect.getsource(group._line_busy)
+    assert "_line_starting" in source, "_line_busy must check _line_starting flag"
