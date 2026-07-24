@@ -28,19 +28,20 @@ def test_npt_default_stays_external():
 
 
 def test_fly_free_run_prepares_before_arm():
-    # With a non-EXT (free-run) trigger, initLine (INIT:IMM) starts
-    # acquisition immediately, so _hw_line must run a "prepare" stage
-    # (trajectory setup + pre-positioning via motor.prepareLine) BEFORE
-    # the "arm" stage. EXT path stays unchanged (gated on the trigger).
+    # With a non-EXT (free-run) trigger, arming a DAQ over CA starts
+    # acquisition immediately (IMM), so the fly loop must run a "prepare"
+    # stage (trajectory setup + pre-positioning via motor.prepareLine)
+    # BEFORE the "daq_arm" stage. EXT path stays unchanged (gated on the
+    # trigger).
     import inspect
     from pystxmcontrol.iocs import fly_ioc
     src = inspect.getsource(fly_ioc)
-    assert 'if line_trigger != "EXT":' in src
+    assert 'line_trigger != "EXT":' in src
     assert 'stage["name"] = "prepare"' in src
     assert 'motor.prepareLine()' in src
-    # ordering: prepare stage precedes the arm stage in the source
+    # ordering: prepare stage precedes the daq_arm stage in the source
     assert src.index('stage["name"] = "prepare"') < \
-        src.index('stage["name"] = "arm"')
+        src.index('stage["name"] = "daq_arm"')
 
 
 def test_fly_slice_builds_for_mmc(tmp_path):
@@ -59,11 +60,7 @@ def test_fly_slice_builds_for_mmc(tmp_path):
          "motors": [{"key": "CoarseX", "entry": entry,
                      "pv": "STXMSIM:MMC:CoarseX"}],
          "derived": [], "motor_pv": {"CoarseX": "STXMSIM:MMC:CoarseX"},
-         "daqs": [{"key": "default", "prefix": "STXMSIM:DEFAULT",
-                   "entry": {"name": "Counter1", "driver": "keysight53230A",
-                             "address": "sim", "port": 5025, "channel": 1,
-                             "ndim": 0, "gate": False, "record": True,
-                             "simulation": True}}]}
+         "daq_pvs": {"default": "STXMSIM:DEFAULT"}}
     p = tmp_path / "slice.json"
     p.write_text(json.dumps(s))
     from pystxmcontrol.iocs.config import read_slice
@@ -94,13 +91,13 @@ def mmc_fly_ioc(ioc_harness):
     daq_entry = {"name": "Counter1", "driver": "keysight53230A",
                  "address": "sim", "port": 5025, "channel": 1, "ndim": 0,
                  "gate": False, "record": True, "simulation": True}
-    daq_pvdb, daq_group = build_pvdb_for_entry(daq_entry, "STXMSIM:DEFAULT")
+    daq_pvdb, _ = build_pvdb_for_entry(daq_entry, "STXMSIM:DEFAULT")
 
     pvdb = {}
     pvdb.update(MotorRecordGroup("STXMSIM:MMC:CoarseX", driver=mx,
                                  motor_config=dict(entry)).pvdb)
     fly = FlyGroup(FLY_PREFIX, motors={"x": mx, "y": my},
-                   daq_groups={"default": daq_group}, simulation=True)
+                   daq_pvs={"default": "STXMSIM:DEFAULT"}, simulation=True)
     pvdb.update(daq_pvdb)
     pvdb.update(fly.pvdb)
     ioc_harness.start(pvdb)
@@ -148,3 +145,21 @@ def test_mmc_fly_line_sim(mmc_fly_ioc):
     d = np.asarray(data.read().data, dtype=float)
     assert len(p) == 25 and len(d) == 25
     assert p[0] == pytest.approx(-5.0) and p[-1] == pytest.approx(5.0)
+
+
+def test_fly_line_data_travels_over_ca(mmc_fly_ioc):
+    """The DAQ service's own :LINE:INDEX advances when the fly IOC runs a
+    line -- proof the fly loop consumed the CA service, not an in-process
+    object."""
+    _, ctx = mmc_fly_ioc
+    start, stop, npts, dwell, arm, go, fly_index = _fly_pvs(
+        ctx, *[f"{FLY_PREFIX}:{s}" for s in (
+            "START", "STOP", "NPOINTS", "DWELL", "ARM", "GO", "INDEX")])
+    (daq_index,) = _fly_pvs(ctx, "STXMSIM:DEFAULT:LINE:INDEX")
+    d0 = daq_index.read().data[0]
+    start.write(-5.0, wait=True); stop.write(5.0, wait=True)
+    npts.write(25, wait=True); dwell.write(1.0, wait=True)
+    arm.write(1, wait=True, timeout=15)
+    go.write(1, wait=True, timeout=60)
+    assert fly_index.read().data[0] >= 1
+    assert daq_index.read().data[0] == d0 + 1

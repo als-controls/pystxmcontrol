@@ -25,11 +25,11 @@ def fly_ioc(ioc_harness):
     fleet = load_fleet(str(REPO / "config" / "motor.json"),
                        str(REPO / "config" / "daq.json"), station="SIM")
     from pystxmcontrol.iocs.daq_ioc import build_pvdb_for_entry
-    daq_pvdb, daq_group = build_pvdb_for_entry(fleet.daqs[0].entry, "STXMSIM:DEFAULT")
+    daq_pvdb, _ = build_pvdb_for_entry(fleet.daqs[0].entry, "STXMSIM:DEFAULT")
 
     from pystxmcontrol.iocs.e712_ioc import FlyGroup
     fly = FlyGroup("STXMSIM:E712:FLY", motors={"x": mx, "y": my},
-                   daq_groups={"default": daq_group}, simulation=True)
+                   daq_pvs={"default": "STXMSIM:DEFAULT"}, simulation=True)
     pvdb = {}
     pvdb.update(daq_pvdb)
     pvdb.update(fly.pvdb)

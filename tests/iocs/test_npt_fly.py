@@ -33,10 +33,10 @@ def npt_fly_ioc(ioc_harness):
     daq_entry = {"name": "Counter1", "driver": "keysight53230A",
                  "address": "sim", "port": 5025, "channel": 1, "ndim": 0,
                  "gate": False, "record": True, "simulation": True}
-    daq_pvdb, daq_group = build_pvdb_for_entry(daq_entry, "STXMSIM:DEFAULT")
+    daq_pvdb, _ = build_pvdb_for_entry(daq_entry, "STXMSIM:DEFAULT")
 
     fly = FlyGroup(FLY_PREFIX, motors={"x": mx, "y": my},
-                   daq_groups={"default": daq_group}, simulation=True)
+                   daq_pvs={"default": "STXMSIM:DEFAULT"}, simulation=True)
     pvdb = {}
     pvdb.update(daq_pvdb)
     pvdb.update(fly.pvdb)
