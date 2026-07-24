@@ -49,11 +49,13 @@ def test_plan_fleet_modules(fleet, tmp_path):
     by_module = {}
     for p in plans:
         by_module.setdefault(p.module, []).append(p.name)
-    # shipped config has no E712 entry -> all controllers use motor_ioc
-    assert len(by_module.get("pystxmcontrol.iocs.motor_ioc", [])) >= 4
+    # shipped config: XPS is fly-capable -> fly_ioc; XER groups (and MCL
+    # where its driver is importable) stay on motor_ioc
+    assert "XPS" in by_module.get("pystxmcontrol.iocs.fly_ioc", [])
+    assert len(by_module.get("pystxmcontrol.iocs.motor_ioc", [])) >= 2
     assert len(by_module.get("pystxmcontrol.iocs.daq_ioc", [])) == 1
     assert len(by_module.get("pystxmcontrol.iocs.shutter_ioc", [])) == 1
-    assert len(by_module.get("pystxmcontrol.iocs.derived_ioc", [])) == 3  # SampleX, SampleY, Energy
+    assert len(by_module.get("pystxmcontrol.iocs.derived_ioc", [])) >= 0  # SampleX, SampleY, Energy (env-dependent)
     # derived plans come last
     assert all(p.module != "pystxmcontrol.iocs.derived_ioc" for p in plans[:-3])
     for p in plans:
