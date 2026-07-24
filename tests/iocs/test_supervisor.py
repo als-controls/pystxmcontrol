@@ -60,92 +60,78 @@ def test_plan_fleet_modules(fleet, tmp_path):
         assert Path(p.slice_path).exists()
 
 
-def test_plan_fleet_e712_absorbs_daqs(tmp_path):
-    import json
-    base = json.loads((REPO / "config" / "motor.json").read_text())
-    cfg = {
-        "FlyX": {
-            "index": 0, "type": "primary", "axis": "x", "driver": "E712Motor",
-            "controllerID": "192.168.1.201", "port": 5000,
-            "controller": "E712Controller", "max velocity": 1000.0,
-            "minValue": -50.0, "maxValue": 50.0, "offset": 0.0, "units": 1.0,
-            "display": True, "simulation": 1,
-        },
-    }
-    mp = tmp_path / "motor.json"
-    mp.write_text(json.dumps(cfg))
-    fleet = load_fleet(str(mp), str(REPO / "config" / "daq.json"), station="SIM")
-    if not fleet.controller_groups:
-        pytest.skip("E712Controller unavailable in this env (pipython guard)")
+def test_plan_fleet_daqs_always_standalone(fleet, tmp_path):
     from pystxmcontrol.iocs.supervisor import plan_fleet
-    from pystxmcontrol.iocs.config import read_slice
-    plans = plan_fleet(fleet, str(tmp_path / "slices"))
-    e712 = [p for p in plans if p.module == "pystxmcontrol.iocs.fly_ioc"]
-    assert len(e712) == 1
-    s = read_slice(e712[0].slice_path)
-    assert [d["key"] for d in s["daqs"]] == ["default"]
-    assert not [p for p in plans if p.module == "pystxmcontrol.iocs.daq_ioc"]
+    plans = plan_fleet(fleet, str(tmp_path))
+    daq_plans = [p for p in plans if p.module == "pystxmcontrol.iocs.daq_ioc"]
+    assert len(daq_plans) == len(fleet.daqs)
+    # DAQ services start before any controller IOC (fly IOCs are their clients)
+    modules = [p.module for p in plans]
+    first_ctrl = min(i for i, m in enumerate(modules)
+                     if m in ("pystxmcontrol.iocs.motor_ioc",
+                              "pystxmcontrol.iocs.fly_ioc"))
+    last_daq = max(i for i, m in enumerate(modules)
+                   if m == "pystxmcontrol.iocs.daq_ioc")
+    assert last_daq < first_ctrl
 
 
-def test_plan_fleet_npt_absorbs_daqs(tmp_path):
-    """A fly-capable nptController group is routed to the fly IOC and absorbs
-    the DAQ entries (no standalone daq_ioc), just like an E712 group."""
+def test_plan_fleet_fly_slice_carries_daq_pvs(fleet, tmp_path):
     import json
-    cfg = {
-        "FineX": {
-            "index": 0, "type": "primary", "axis": "x", "driver": "nptMotor",
-            "controllerID": "7340015A", "port": 0, "controller": "nptController",
-            "max velocity": 1000.0, "minValue": -50.0, "maxValue": 50.0,
-            "offset": 0.0, "units": 1.0, "display": True, "simulation": 1,
-        },
-        "FineY": {
-            "index": 1, "type": "primary", "axis": "y", "driver": "nptMotor",
-            "controllerID": "7340015A", "port": 0, "controller": "nptController",
-            "max velocity": 1000.0, "minValue": -50.0, "maxValue": 50.0,
-            "offset": 0.0, "units": 1.0, "display": True, "simulation": 1,
-        },
-    }
-    mp = tmp_path / "motor.json"
-    mp.write_text(json.dumps(cfg))
-    fleet = load_fleet(str(mp), str(REPO / "config" / "daq.json"), station="SIM")
-    if not fleet.controller_groups:
-        pytest.skip("nptController unavailable in this env")
     from pystxmcontrol.iocs.supervisor import plan_fleet
-    from pystxmcontrol.iocs.config import read_slice
-    plans = plan_fleet(fleet, str(tmp_path / "slices"))
+    plans = plan_fleet(fleet, str(tmp_path))
     fly = [p for p in plans if p.module == "pystxmcontrol.iocs.fly_ioc"]
-    assert len(fly) == 1
-    s = read_slice(fly[0].slice_path)
-    assert s["controller_cls"] == "nptController"
-    assert [d["key"] for d in s["daqs"]] == ["default"]
-    assert not [p for p in plans if p.module == "pystxmcontrol.iocs.daq_ioc"]
+    for p in fly:
+        with open(p.slice_path) as f:
+            s = json.load(f)
+        assert "daqs" not in s
+        assert set(s["daq_pvs"]) == {d.key for d in fleet.daqs}
 
 
-def test_plan_fleet_rejects_multiple_e712_groups(tmp_path):
-    """Two E712Controller groups would both try to absorb ALL daq entries
-    (duplicate PVs + double hardware ownership) -- plan_fleet must reject
-    this until multi-E712 DAQ mapping is implemented (follow-up)."""
+def test_plan_fleet_multiple_fly_groups_allowed(fleet, tmp_path):
+    """Two fly-capable groups in one fleet must plan without raising and
+    each get daq_pvs for ALL daqs."""
+    import copy, json
+    from pystxmcontrol.iocs.supervisor import plan_fleet
+    f2 = copy.deepcopy(fleet)
+    fly_capable = [g for g in f2.controller_groups
+                   if g.controller_cls in ("E712Controller", "nptController",
+                                           "mmcController")]
+    if len(fly_capable) < 2:
+        # synthesize a second fly group from the first
+        src = copy.deepcopy(fly_capable[0] if fly_capable
+                            else f2.controller_groups[0])
+        src.controller_cls = "mmcController"
+        src.label = src.label + "_B"
+        src.controller_id = src.controller_id + "_B"
+        f2.controller_groups.append(src)
+        if not fly_capable:
+            f2.controller_groups[-1].controller_cls = "mmcController"
+            fly_capable = [f2.controller_groups[-1]]
+            src2 = copy.deepcopy(src); src2.label += "2"; src2.controller_id += "2"
+            f2.controller_groups.append(src2)
+    plans = plan_fleet(f2, str(tmp_path))
+    fly_plans = [p for p in plans if p.module == "pystxmcontrol.iocs.fly_ioc"]
+    assert len(fly_plans) >= 2
+    for p in fly_plans:
+        with open(p.slice_path) as f:
+            s = json.load(f)
+        assert set(s["daq_pvs"]) == {d.key for d in f2.daqs}
+
+
+def test_daq_slice_gate_disabled_when_shutter_owns_it(fleet, tmp_path):
+    """A DAQ whose gate address is owned by a shutter IOC must be sliced
+    with gate=False so the standalone daq_ioc never opens the Arduino."""
     import json
     from pystxmcontrol.iocs.supervisor import plan_fleet
-    entry = {
-        "index": 0, "type": "primary", "axis": "x", "driver": "E712Motor",
-        "port": 5000, "controller": "E712Controller", "max velocity": 1000.0,
-        "minValue": -50.0, "maxValue": 50.0, "offset": 0.0, "units": 1.0,
-        "display": True, "simulation": 1,
-    }
-    cfg = {
-        "FlyX": dict(entry, controllerID="192.168.1.201"),
-        "FlyX2": dict(entry, controllerID="192.168.1.202"),
-    }
-    mp = tmp_path / "motor.json"
-    mp.write_text(json.dumps(cfg))
-    fleet = load_fleet(str(mp), str(REPO / "config" / "daq.json"), station="SIM")
-    if len([g for g in fleet.controller_groups
-            if g.controller_cls == "E712Controller"]) < 2:
-        pytest.skip("E712Controller unavailable in this env (pipython guard) "
-                     "or the two controllerIDs were grouped into one")
-    with pytest.raises(ValueError, match="fly-capable controller groups"):
-        plan_fleet(fleet, str(tmp_path / "slices"))
+    plans = plan_fleet(fleet, str(tmp_path))
+    shutter_addrs = {sh.address for sh in fleet.shutters}
+    for p in plans:
+        if p.module != "pystxmcontrol.iocs.daq_ioc":
+            continue
+        with open(p.slice_path) as f:
+            s = json.load(f)
+        if s["entry"].get("gate address") in shutter_addrs:
+            assert not s["entry"].get("gate")
 
 
 def test_supervisor_restarts_crashed_ioc(tmp_path, free_port):

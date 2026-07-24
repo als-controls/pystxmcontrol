@@ -187,7 +187,7 @@ def load_fleet(motor_json_path: str, daq_json_path: str, station: str = "SIM") -
 
 # --- slice files handed to IOC subprocesses (Windows spawn-safe: path arg, not blob) ---
 
-def write_slice(group, fleet: FleetConfig, path: str, daqs: list["DaqEntry"] | None = None) -> None:
+def write_slice(group, fleet: FleetConfig, path: str, daq_pvs: dict[str, str] | None = None) -> None:
     if isinstance(group, ControllerGroup):
         payload = {
             "kind": "controller",
@@ -201,8 +201,8 @@ def write_slice(group, fleet: FleetConfig, path: str, daqs: list["DaqEntry"] | N
             "derived": [{"key": m.key, "entry": m.entry, "pv": m.pv} for m in group.derived],
             "motor_pv": fleet.motor_pv,
         }
-        if daqs:
-            payload["daqs"] = [{"key": d.key, "entry": d.entry, "prefix": d.prefix} for d in daqs]
+        if daq_pvs:
+            payload["daq_pvs"] = dict(daq_pvs)
         # gate address -> shutter :MODE PV prefix, so the fly IOC can drive the
         # beam shutter (owned by the shutter IOC) over CA during a line.
         payload["shutters"] = {sh.address: sh.prefix for sh in fleet.shutters}
@@ -217,8 +217,17 @@ def write_slice(group, fleet: FleetConfig, path: str, daqs: list["DaqEntry"] | N
             "motor_pv": fleet.motor_pv,
         }
     elif isinstance(group, DaqEntry):
+        entry = dict(group.entry)
+        if entry.get("gate") and any(sh.address == entry.get("gate address")
+                                     for sh in fleet.shutters):
+            # The Arduino gate/shutter is owned by the dedicated shutter IOC;
+            # the standalone DAQ service must not open that serial port
+            # (keysight.start would contend and hang). Beam gating happens
+            # via the shutter IOC's CA PV, commanded by fly IOCs per line.
+            entry = dict(entry, gate=False)
         payload = {"kind": "daq", "station": fleet.station, "key": group.key,
-                   "entry": group.entry, "prefix": group.prefix, "motor_pv": fleet.motor_pv}
+                   "entry": entry, "prefix": group.prefix,
+                   "motor_pv": fleet.motor_pv}
     elif isinstance(group, ShutterEntry):
         payload = {"kind": "shutter", "station": fleet.station, "key": group.key,
                    "address": group.address, "prefix": group.prefix,

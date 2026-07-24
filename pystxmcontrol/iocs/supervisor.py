@@ -38,34 +38,23 @@ def plan_fleet(fleet: FleetConfig, slice_dir: str,
                shutter_iocs: bool = True, startup_delay: float = 3.0) -> list[IocPlan]:
     Path(slice_dir).mkdir(parents=True, exist_ok=True)
     plans: list[IocPlan] = []
-    fly_groups = [g for g in fleet.controller_groups
-                  if g.controller_cls in FLY_CAPABLE_CONTROLLERS]
-    if len(fly_groups) > 1:
-        raise ValueError(
-            f"plan_fleet: {len(fly_groups)} fly-capable controller groups found "
-            f"({[g.label for g in fly_groups]}); every fly group absorbs "
-            "ALL daq entries, so multiple fly controllers would duplicate "
-            "DAQ PVs across IOCs and give two controllers ownership of the "
-            "same hardware. Multi-fly DAQ mapping is a follow-up "
-            "(see docs/superpowers/2026-07-12-caproto-iocs-followups.md).")
-    fly_ids = {id(g) for g in fly_groups}
-    daqs_absorbed = bool(fly_groups)
+    # DAQ services FIRST: every fly IOC is a CA client of them.
+    for d in fleet.daqs:
+        p = str(Path(slice_dir) / f"daq_{d.key}.json")
+        write_slice(d, fleet, p)
+        plans.append(IocPlan(name=f"daq_{d.key}",
+                             module="pystxmcontrol.iocs.daq_ioc", slice_path=p))
+    daq_pvs = {d.key: d.prefix for d in fleet.daqs}
     for g in fleet.controller_groups:
         p = str(Path(slice_dir) / f"{g.label}.json")
-        if id(g) in fly_ids:
-            write_slice(g, fleet, p, daqs=fleet.daqs)
+        if g.controller_cls in FLY_CAPABLE_CONTROLLERS:
+            write_slice(g, fleet, p, daq_pvs=daq_pvs)
             plans.append(IocPlan(name=g.label, module="pystxmcontrol.iocs.fly_ioc",
                                  slice_path=p))
         else:
             write_slice(g, fleet, p)
             plans.append(IocPlan(name=g.label, module="pystxmcontrol.iocs.motor_ioc",
                                  slice_path=p))
-    if not daqs_absorbed:
-        for d in fleet.daqs:
-            p = str(Path(slice_dir) / f"daq_{d.key}.json")
-            write_slice(d, fleet, p)
-            plans.append(IocPlan(name=f"daq_{d.key}",
-                                 module="pystxmcontrol.iocs.daq_ioc", slice_path=p))
     if shutter_iocs:
         for sh in fleet.shutters:
             p = str(Path(slice_dir) / f"{sh.key}.json")
