@@ -28,6 +28,18 @@ By default, the supervisor reads `motor.json` and `daq.json` from the installed 
 | `--status-interval` | `10.0` | Period (seconds) to print IOC status table; pass `0` to disable. |
 | `--startup-delay` | `3.0` | Delay (seconds) before starting derived IOCs, allowing primary IOCs to become network-accessible. |
 
+## Supervisor Architecture
+
+The `pystxmcontrol stxm-iocs` supervisor is responsible for spawning and managing all IOC processes in the correct order:
+
+1. **DAQ IOC Services (first):** All standalone DAQ IOCs are started first, each wrapping one hardware DAQ module and exposed as a CA service (e.g., `STXM7011:DAQ_I0`). This ensures the DAQ CA services are network-accessible before controller IOCs attempt to arm them.
+
+2. **Primary Motor/Controller IOCs (second):** After a brief startup delay (default 3 seconds), the supervisor spawns motor IOCs for all configured controllers (E712, nPoint, Micronix, XPS, etc.). Controllers that support fly scanning (e.g., E712) include a FLY group that acts as a CA client of the DAQ services.
+
+3. **Derived Motor IOCs (third):** After another startup delay, derived IOCs are spawned (if any). These use `CAMotorProxy` to read underlying-motor positions via CA and are therefore started last.
+
+4. **Status Monitoring:** The supervisor maintains a per-IOC status table (printed periodically; configurable with `--status-interval`) showing state, PV count, and CA listen counts, helping diagnose IOC health during runtime.
+
 ## PV Surface
 
 Each controller generates one IOC process. Motors expose standard EPICS motor-record fields; E712 controllers additionally host a FLY group with waveform and line-control PVs.
@@ -52,7 +64,21 @@ Per-motor PVs are named `STXM{station}:{controller}:{axis}.*` and expose the ful
 
 ### FLY Group (E712 IOCs Only)
 
-When an E712 controller is present, the supervisor creates one E712 IOC with a FLY PVGroup at `STXM{station}:{E712_label}:FLY`. The FLY group runs the IOC-side line loop and synchronizes DAQ acquisition.
+When an E712 controller is present, the supervisor creates one E712 IOC with a FLY PVGroup at `STXM{station}:{E712_label}:FLY`. The FLY group orchestrates the line loop: it profiles the motor velocity, triggers all attached DAQ services via CA, and reads their waveforms.
+
+The FLY IOC acts as a **CA client** of the standalone DAQ IOCs (see [DAQ Services](#daq-services-standalone-ca-iocs)). When a line is requested:
+
+1. The FLY IOC validates motor parameters (START, STOP, NPOINTS, DWELL).
+2. For each DAQ service, it writes NPOINTS, TRIGGER, and sends an ARM command via CA (put-completion waits for each DAQ's `:LINE:STATUS` to reach `ARMED`).
+3. The FLY IOC issues the motor velocity command and waits for the E712 hardware to complete the line (velocity-based timing ensures the motor travels the line in `NPOINTS * DWELL / 1000` seconds).
+4. The E712 hardware generates a line-start trigger (to DAQ trigger inputs if configured as `EXT`).
+5. While the motor moves, the FLY IOC polls all DAQs for their `:LINE:INDEX` increment, which signals waveform readiness.
+6. Once all DAQs have incremented, the FLY IOC reads each DAQ's `:COUNTS:WF` via CA.
+7. The FLY IOC increments its own `:INDEX`, signaling that `:POS` and all `:DATA:*` cache the completed line.
+
+**Shared Detector Contention:** Any number of fly-capable controllers (E712, nPoint, Micronix) may share the same detector set. When one controller's FLY loop arms all DAQs and holds them through to line completion, a second controller's concurrent ARM attempt will be **rejected by the DAQ IOC** with `:LINE:ERROR = "ARM rejected: line in progress"`. The second controller's client loop must back off (re-read `:LINE:ERROR` after ARM to detect rejection) and retry after the first line completes.
+
+**PV Summary (FLY Orchestration):**
 
 | PV | R/W | Semantics |
 |----|-----|-----------|
@@ -62,14 +88,14 @@ When an E712 controller is present, the supervisor creates one E712 IOC with a F
 | `:DWELL` | RW | **Dwell per point** (milliseconds). Must be > 0. |
 | `:AXIS` | RW | **Axis enum** (selects which motor to fly). Choices depend on controller axes; default is the first axis. |
 | `:MODE` | RW | **Fly mode:** `raster` (line repeats at START, moves to STOP, returns to START) or `continuous` (no turnaround, next line starts immediately at STOP position). |
-| `:ARM` | RW | **Arm the IOC** for a line. Write 1 to validate START/STOP/NPOINTS/DWELL and enter ARMED state. If state is FLYING, the ARM is rejected: `:ERROR` is set to `"ARM while FLYING rejected"` and `:STATE` is left unchanged. |
+| `:ARM` | RW | **Arm the IOC and all DAQ services** for a line. Write 1 to validate motor parameters and arm all configured DAQ services via CA. Enters ARMED state only if all DAQs accept the ARM (if any DAQ rejects, fails immediately with `:ERROR`). |
 | `:GO` | RW | **Start a fly line.** Write 1 only when state is ARMED. Blocks until the line completes or ABORT is triggered. |
-| `:ABORT` | RW | **Abort the current fly line.** Write 1 to stop the IOC-side motor and DAQ at the next sampling point. |
+| `:ABORT` | RW | **Abort the current fly line.** Write 1 to stop the IOC-side motor and all DAQ services at the next sampling point. |
 | `:STATE` | RO | **IOC state:** `IDLE`, `ARMED`, `FLYING`, or `ERROR`. Read-only; only ARM, GO, and ABORT change it. |
-| `:ERROR` | RO | **Error message** (up to 256 chars) if state is ERROR. |
+| `:ERROR` | RO | **Error message** (up to 256 chars) if state is ERROR. May include DAQ contention details (e.g., `"DAQ_I0 ARM rejected: line in progress"`). |
 | `:POS` | RO | **Position waveform** (read-only). The actual motor positions for the most recent completed line (length = NPOINTS). |
-| `:INDEX` | RO | **Line index.** Increments by 1 after each completed line. **Consistency contract:** clients MUST monitor `:INDEX`; when it increments, all `:DATA:*` and `:POS` waveforms for that line are already written in full. |
-| `:DATA:{key}` | RO | **DAQ waveform** for detector `key` (one per DAQ). Read-only; updated by the FLY loop each line. Data is only valid after `:INDEX` increments. |
+| `:INDEX` | RO | **Line index.** Increments by 1 after each completed line. **Consistency contract:** clients MUST monitor `:INDEX`; when it increments, all `:DATA:*` and `:POS` waveforms for that line are fully cached and ready to read. |
+| `:DATA:{key}` | RO | **DAQ waveform cache** for detector `key` (one per DAQ). Read-only; populated by the FLY loop from the corresponding standalone DAQ's `:COUNTS:WF` after the line completes. Data is only valid after `:INDEX` increments. |
 
 ### Fly-Capable Controllers
 
@@ -92,18 +118,47 @@ The following controllers are supported for continuous fly-line scanning:
   Transport is serial (`COM*`/`/dev/tty*`, 38400 8N1) or TCP (`address` +
   nonzero `port`), chosen from the address format.
 
-### DAQ Group (Keysight Counter Family)
+### DAQ Services (Standalone CA IOCs)
 
-Standalone DAQ IOCs (if no E712 group exists) expose a DaqGroup at `STXM{station}:DAQ_{daq_key}.*`:
+Every DAQ hardware module is wrapped as a standalone CA IOC service (`daq_ioc`) exposing a DaqGroup at `STXM{station}:DAQ_{daq_key}.*`. The DAQ IOC implements both **point mode** (single-sample acquisition on demand) and **line mode** (waveform acquisition synchronized by an external coordinator, such as the FLY loop):
+
+#### Point Mode (Single-Sample Acquisition)
 
 | PV | R/W | Semantics |
 |----|-----|-----------|
 | `:DWELL` | RW | **Dwell per point** (milliseconds, 3 decimal places). |
-| `:MODE` | RW | **Acquisition mode:** `point` (single-point acquire) or `line` (internal to FLY loop; not used in DAQ IOC standalone). |
-| `:ACQUIRE` | RW | **Single-point acquire.** Write 1 to acquire one point; put-completion waits for acquisition to finish. Updates `:COUNTS` and `:RATE`. |
+| `:ACQUIRE` | RW | **Single-point acquire.** Write 1 to acquire one point; put-completion (`caput -c`) waits for acquisition to finish. Updates `:COUNTS` and `:RATE`. |
 | `:COUNTS` | RO | **Last acquired count value.** Updated after every point. |
-| `:COUNTS:WF` | RO | **Counts waveform.** Updated only by the FLY loop's `write_line` (in-process); point-mode `:ACQUIRE` does not touch it. |
 | `:RATE` | RO | **Count rate** (counts/second), computed as `COUNTS / (DWELL_ms / 1000)`. |
+
+#### Line Mode (Waveform Acquisition, CA-Coordinated)
+
+When a fly IOC or other external client initiates a line acquisition, it performs the following sequence:
+
+1. Write `NPOINTS` to set the number of points in the line.
+2. Write `TRIGGER` enum (`EXT`, `IMM`, or `BUS`) to select the trigger source.
+3. Write 1 to `:LINE:ARM`; put-completion waits for `:LINE:STATUS` to become `ARMED`.
+4. External client triggers the line (via E712 hardware start signal, bus trigger, or immediate software trigger, depending on the TRIGGER mode).
+5. DAQ acquires `NPOINTS` samples asynchronously.
+6. When acquisition completes, `:LINE:INDEX` increments (atomic write); this signals that `:COUNTS:WF` is fully written and ready to read.
+7. Client reads `:COUNTS:WF` (guaranteed consistency: all `NPOINTS` values are finalized).
+
+**Contention Rejection:** If a second client attempts to ARM while a line is in progress, the DAQ IOC rejects it by setting `:LINE:ERROR` to `"ARM rejected: line in progress"` and leaving `:LINE:STATUS` unchanged. Clients detect contention by reading `:LINE:ERROR` immediately after an ARM put.
+
+**Watchdog Auto-Disarm:** The DAQ service runs an internal watchdog timer set to `max(5 s, 4 * NPOINTS * DWELL / 1000 + 5 s)`. If no completion signal is received within this time, the DAQ IOC automatically disarms and sets `:LINE:ERROR` to `"Line timeout; armed state cleared"`. This prevents deadlock if the external trigger source fails.
+
+**PV Summary (Line Mode):**
+
+| PV | R/W | Semantics |
+|----|-----|-----------|
+| `:LINE:NPOINTS` | RW | Number of points to acquire in the line (1 to hardware max). |
+| `:LINE:TRIGGER` | RW | Trigger source enum: `EXT` (hardware trigger line), `IMM` (immediate, arm-to-start), or `BUS` (software bus trigger). |
+| `:LINE:ARM` | RW | Write 1 to arm for a line. Put-completion waits for `:LINE:STATUS` to reach `ARMED`. Rejects if status is already `ACQUIRING` or `ERROR`. |
+| `:LINE:INDEX` | RO | Increments by 1 when a line completes; **consistency contract:** when `:LINE:INDEX` changes, `:COUNTS:WF` is fully written and consistent. Clients MUST monitor `:LINE:INDEX` to synchronize waveform reads. |
+| `:LINE:ABORT` | RW | Write 1 to stop acquisition immediately. Sets `:LINE:STATUS` to `IDLE` and clears any pending completion. |
+| `:LINE:STATUS` | RO | Line state: `IDLE`, `ARMED`, `ACQUIRING`, or `ERROR`. |
+| `:LINE:ERROR` | RO | Error message (up to 256 chars) if status is `ERROR`; e.g., `"ARM rejected: line in progress"` or `"Line timeout; armed state cleared"`. |
+| `:COUNTS:WF` | RO | Counts waveform (length = NPOINTS), updated atomically when a line completes (after `:LINE:INDEX` increments). |
 
 ### Shutter/Gate Group
 
