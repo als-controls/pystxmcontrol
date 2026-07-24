@@ -16,6 +16,8 @@ Recorded during the final whole-branch review of `feature/caproto-iocs`. Terse, 
 - The `:AXIS` non-default-index write path is untested.
 - Hardware DAQ `getPoint` blocking-IO audit: confirm it never blocks the asyncio loop on real hardware the way it's assumed to in sim.
 - MCL driver loads a vendor `.so` in `__init__`, making sim unusable on hosts without that library installed; consider lazy-loading or an upstream PR.
+- Shared-DAQ contention hardening (added 2026-07-24): the `:LINE:*` service has no per-arm token, so under *interleaved* multi-scanner use of one detector two races exist -- (a) stale-index: a foreign line completing between `_armed_from` capture and our arm makes `wait_line` accept the foreign waveform; (b) rejection crosstalk: a foreign client's "ARM rejected" on the shared `:LINE:ERROR` PV can make a successfully-armed client falsely abort. Serialized use (the current operational mode, enforced by the busy guard) is unaffected. Fix with a per-arm sequence/token PV before genuinely concurrent dual-scanner ops.
+- First-line CA connect latency: DaqClient connects its 9 PVs lazily on the first line (up to seconds), which can eat the fly deadline's +2s grace and fire the outer backstop; consider a warm-up connect at fly-IOC start.
 - Upstream PR to David with the caproto IOC layer changes once stabilized.
 - CSM / iocular integration for deploying these IOCs.
 - Spec #3: Lightfall EPICS migration using this IOC layer.
