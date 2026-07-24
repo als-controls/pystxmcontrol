@@ -18,12 +18,13 @@ needs nothing else — fly_ioc and the DAQ services are controller-agnostic.
 TCP to `address:5001` (config `port` respected). ASCII commands
 `Function(arg1,arg2,...)`; replies `errcode,payload,EndOfAPI` (reply may span
 multiple recv calls — read until `,EndOfAPI`). `errcode` 0 = success.
-**Motion-command replies arrive at move COMPLETION** — `GroupMoveAbsolute`
-blocks on the wire for the duration of the move. Key functions used:
-`GroupMoveAbsolute(positioner, target)`, `GroupMoveAbort(group)`,
+Note: motion-command replies arrive at move COMPLETION on the issuing
+socket — which is why David's flow polls position on a second (monitor)
+socket rather than waiting for the reply. Functions used (the legacy set,
+unchanged): `GroupMoveRelative(group, displacement)`,
 `GroupPositionCurrentGet(group, double *)`,
 `PositionerSGammaParametersGet/Set(positioner, vel, accel, minJerkT, maxJerkT)`,
-`GroupStatusGet(group, int *)`, `GroupMotionDisable/Enable(group)`.
+`GroupMotionDisable/Enable(group)`.
 Axis naming: motor.json `axis` = `"Group.Positioner"`; group = the prefix
 before the dot; position reads and aborts address the group, SGamma the full
 positioner name.
@@ -37,23 +38,31 @@ positioner name.
 - `XPSError(IOError)` raised on socket failure/timeout, malformed reply
   (no `,EndOfAPI`), or nonzero XPS error code (message includes the code and
   the command). No more `[-2, '']` sentinel tuples, no `eval()`.
-- **Two persistent TCP sockets**, both created in `initialize()`:
-  - `_motion` — motion commands only. Its reply blocks until the move
-    completes, so a blocking `moveTo` is just "send + read reply" with a
-    per-call timeout (`settimeout(move_timeout)` around the transaction).
-  - `_control` — queries and `GroupMoveAbort`. Exists so `stop()` works
-    WHILE the motion socket is blocked mid-move (the IOC layer deliberately
-    calls `driver.stop()` without the io_lock so it can interrupt a
-    blocking move).
+**Guiding rule (Ron): keep David's known-good DEVICE-INTERACTION approaches
+verbatim; the rewrite is code structure only** (typed errors, no `eval()`,
+one framing/parsing site, lock-agnostic, simulation mode). Anything that
+looks like a device-interaction weakness is itemized for later review (see
+"Itemized device-interaction weaknesses"), NOT changed in this pass.
+
+- **Two persistent TCP sockets**, both created in `initialize()` — same as
+  David's control + monitor socket pair:
+  - `_control` — motion commands, SGamma set, disable/enable.
+  - `_monitor` — position/status queries, so completion polling reads
+    positions while a move command's reply is still pending on `_control`.
 - `_transact(sock, command, timeout=None) -> str payload`: encode, send,
   recv-loop until `,EndOfAPI`, split off errcode, raise `XPSError` if
-  nonzero. All framing/parsing lives HERE.
-- Thin protocol wrappers (all raise `XPSError` on failure):
-  `move_absolute(positioner, target, timeout)` (motion socket),
-  `abort_group(group)`, `get_position(group) -> float`,
-  `get_status(group) -> int`, `get_sgamma(positioner) -> (vel, accel,
-  min_jerk, max_jerk)` (float parsing), `set_sgamma(positioner, vel, accel,
-  min_jerk, max_jerk)`, `disable_group(group)` / `enable_group(group)`.
+  nonzero. All framing/parsing lives HERE (this replaces the scattered
+  `__sendAndReceive` copies and the `eval()` in getParameters — structure
+  only, the wire traffic is unchanged).
+- Thin protocol wrappers (all raise `XPSError` on failure), each emitting
+  EXACTLY the same XPS function calls the legacy driver used:
+  `move_relative(group, displacement)` (fire on `_control`; completion is
+  polled, David's semantics), `get_position(group) -> float` (`_monitor`),
+  `get_sgamma(positioner)` / `set_sgamma(positioner, ...)`,
+  `disable_group(group)` / `enable_group(group)`.
+- `abort_move(group)` — David's abort: `GroupMotionDisable`, 1 s pause,
+  `GroupMotionEnable`, 1 s pause. (GroupMoveAbort is itemized below as a
+  candidate improvement, NOT used now.)
 - Lock-agnostic: NO threading locks (IOC `io_lock` serializes; the sole
   intentional concurrency — abort during move — uses the separate socket).
 - Simulation: no I/O; per-positioner `positions` dict and `sgamma` dict on
@@ -67,23 +76,22 @@ Point-to-point (what `MotorRecordGroup` drives):
   `group`; inherits `controller.simulation`; latches initial position and
   SGamma params (velocity/accel/jerk) when not simulating.
 - `checkLimits(pos)` — raises `SoftwareLimitError` (lower/upper), as today.
-- `moveTo(pos)` — limits check; offset/units transform (`(pos - offset) /
-  units`, 3-decimal round); `controller.move_absolute(...,
-  timeout=config.get("timeout", 60))`. Blocking-reply semantics: the reply
-  IS move completion — no polling loop, no position-tolerance heuristic,
-  ABSOLUTE moves (the legacy relative-move workaround for "absolute moves
-  get inaccurate" is dropped; re-check on hardware and revert one method if
-  the pathology reappears). On `XPSError` timeout: `abort_group` then
-  re-raise.
-- `getPos()` — `get_position(group) * units + offset`.
-- `getStatus()` — `get_status(group)`; moving = status code in the XPS
-  "moving" class (43-44 for SGamma moves; expose as module constant
-  `_MOVING_STATUS = frozenset({43, 44})`, confirm/extend at the beamline).
-- `stop()` — `abort_group(group)` (GroupMoveAbort). The legacy
-  disable/enable abort is GONE from stop(); `disable()`/`enable()` remain
-  as explicit methods.
-- `setAxisParams(velocity=)` / `get_velocity()` — SGamma read-modify-write:
-  set velocity, keep accel/jerk untouched.
+- `moveTo(pos)` — **David's semantics preserved exactly**: limits check;
+  offset/units transform; RELATIVE move composed from the current position
+  (`GroupMoveRelative(group, target - current)` — the documented workaround
+  for "an XPS can get in a state where absolute moves are inaccurate");
+  completion by polling `get_position(group)` on the monitor socket until
+  `|target - current| <= position_tolerance` (default 5.0, config
+  `"position_tolerance"` override) with `config.get("timeout", ...)`
+  seconds budget (legacy default preserved); on timeout: `abort_move`
+  (disable/enable) then raise `XPSError`.
+- `getPos()` — `get_position(group) * units + offset` (monitor socket).
+- `getStatus()` — driver-local moving flag, as in the legacy driver (no
+  new GroupStatusGet dependency in this pass).
+- `stop()` — `abort_move(group)` (David's disable/enable abort, unchanged).
+- `setAxisParams(velocity=)` / `get_velocity()` — SGamma read-modify-write
+  keeping accel/jerk untouched, INCLUDING the legacy `velocity * 1000`
+  scale factor in setAxisParams (itemized below; do not "fix" silently).
 - Simulation: controller sim dicts, same contract as mmcMotor.
 
 Fly interface (identical contract to `mmcMotor`):
@@ -98,8 +106,9 @@ Fly interface (identical contract to `mmcMotor`):
 - `prepareLine()` — stash cruise SGamma velocity (guarded: only when not
   already `_prepared`, so a re-prepare after an aborted line keeps the
   ORIGINAL cruise value), `moveTo(line start)`, set line velocity.
-- `moveLine()` — prepared: single blocking `move_absolute` to the stop
-  position with timeout `max(5, 4 × line_time + 5)`; unprepared: fully
+- `moveLine()` — prepared: one `moveTo(line stop)` call (David's
+  relative-move + position-poll semantics) with the line deadline
+  `max(5, 4 × line_time + 5)` as the timeout budget; unprepared: fully
   self-contained (stash, position, velocity, move); cruise velocity
   restored in `finally` (best-effort, never masks the original error);
   `_prepared` cleared in `finally`.
@@ -138,14 +147,32 @@ and surfaces fly errors on `:ERROR`.
 - Backlash/kill/home surface beyond what exists today.
 - GPIO analog functions (dropped from the legacy driver; unused).
 
+## Itemized device-interaction weaknesses (kept as-is; review later with David)
+
+Per Ron's rule these legacy behaviors are PRESERVED in this pass. Each is a
+candidate improvement to review at the beamline:
+
+1. `abort_move` = GroupMotionDisable + 1 s + GroupMotionEnable + 1 s (servo
+   drop + 2 s dead time) instead of `GroupMoveAbort`.
+2. Relative-move composition (`target - current`) instead of
+   `GroupMoveAbsolute` — accumulates the readback error of the pre-move
+   position read into the target.
+3. Completion by position tolerance (default 5.0 units — coarse) rather
+   than `GroupStatusGet` motion status; a move that stalls INSIDE tolerance
+   reads as success.
+4. `setAxisParams` multiplies velocity by 1000 (units quirk, undocumented).
+5. `getStatus` is a driver-local flag, not a controller query.
+6. Move command's reply (which arrives at motion end) is never read on the
+   control socket before the next command on that socket — relies on the
+   XPS tolerating a pending reply + new command on one connection (David's
+   flow; works in practice).
+
 ## Hardware checklist (next beamline visit)
 
-- Absolute vs relative move accuracy (legacy workaround dropped) — verify
-  repeatability; revert `moveTo` to relative-move composition if needed.
-- `GroupStatusGet` moving-status codes for the actual stage groups (43/44
-  assumed for SGamma moves).
-- Long-move socket-timeout margins; abort-during-move over the control
-  socket (`GroupMoveAbort` vs the old disable/enable).
+- Regression check against legacy behavior: jog, limits, stop mid-move
+  (disable/enable abort), long-move timeout margins.
 - SGamma restore after fly lines (cruise velocity intact after abort).
+- Review the itemized weaknesses above with David; promote fixes
+  individually with hardware verification.
 - First-line DaqClient connect latency (shared-DAQ follow-up) applies to
   XPS fly lines too.
