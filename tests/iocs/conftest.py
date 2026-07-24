@@ -102,6 +102,29 @@ def slow_sim_motor():
         simulation = True
         moving = False
 
+        def __init__(self):
+            self.positions = {}  # group -> position (in controller units)
+
+        def get_position(self, group):
+            """Return current position for the group (in controller units)."""
+            return self.positions.get(group, 0.0)
+
+        def get_sgamma(self, positioner):
+            """Return SGamma parameters (velocity, accel, minJ, maxJ) for fly interface."""
+            return (1000.0, 80.0, 0.02, 0.04)
+
+        def set_sgamma(self, positioner, vel, accel, minJ, maxJ):
+            """Set SGamma parameters."""
+            pass
+
+        def move_relative(self, group, displacement):
+            """Start a relative move (no-op in stub, position updated by SlowSimMotor)."""
+            pass
+
+        def abort_move(self, group):
+            """Abort motion (no-op in stub)."""
+            pass
+
     class SlowSimMotor(xpsMotor):
         move_duration = 0.5
 
@@ -115,8 +138,11 @@ def slow_sim_motor():
                         return
                     frac = 1 - (deadline - time.time()) / self.move_duration
                     self._controller_position = start + frac * (pos - start)
+                    # Sync with controller.positions for getPos() to work
+                    self.controller.positions[self.group] = self._controller_position
                     time.sleep(0.02)
                 self._controller_position = pos
+                self.controller.positions[self.group] = pos
 
         def stop(self):
             self._stop_requested = True
@@ -124,8 +150,12 @@ def slow_sim_motor():
     m = SlowSimMotor()
     m.controller = SlowSimController()
     m.config = {"units": 1, "offset": 0, "minValue": -40, "maxValue": 40,
-                "max velocity": 1000.0, "simulation": 1}
+                "max velocity": 1000.0, "simulation": 1, "position_tolerance": 0.01}
     m.simulation = True
+    m.group = "SIM"  # set group for controller position tracking
+    m.axis = "SIM.1"  # set axis for SGamma calls
+    m._controller_position = 0.0
+    m.controller.positions[m.group] = 0.0
     return m
 
 
