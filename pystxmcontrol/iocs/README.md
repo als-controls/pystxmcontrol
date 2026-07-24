@@ -118,6 +118,14 @@ The following controllers are supported for continuous fly-line scanning:
   Transport is serial (`COM*`/`/dev/tty*`, 38400 8N1) or TCP (`address` +
   nonzero `port`), chosen from the address format.
 
+- `xpsController` (Newport XPS): constant-velocity software-timed fly lines
+  (`xpsMotor.line_trigger = "IMM"`, free-running DAQ). The driver preserves
+  the legacy device-interaction semantics (relative moves + position-
+  tolerance completion, disable/enable abort); known quirks are itemized in
+  docs/superpowers/specs/2026-07-24-xps-fly-integration-design.md for later
+  hardware review. PVT trajectories + position-compare EXT triggering are a
+  recorded follow-up.
+
 ### DAQ Services (Standalone CA IOCs)
 
 Every DAQ hardware module is wrapped as a standalone CA IOC service (`daq_ioc`) exposing a DaqGroup at `STXM{station}:DAQ_{daq_key}.*`. The DAQ IOC implements both **point mode** (single-sample acquisition on demand) and **line mode** (waveform acquisition synchronized by an external coordinator, such as the FLY loop):
