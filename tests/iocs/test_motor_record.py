@@ -127,6 +127,44 @@ def test_driver_exception_recovers(motor_ioc):
     assert abs(drv.getPos() - 7.0) < 1e-6
 
 
+def test_stop_exception_recovers(motor_ioc):
+    """F1b: a raising driver.stop() must not kill the record's polling loop
+    (and thus the whole caproto server) -- log it and keep going. The
+    record must still respond after the failed STOP, and a subsequent move
+    must still complete normally."""
+    h, ctx, drv = motor_ioc
+    val, stop, dmov, rbv = ctx.get_pvs(
+        "TEST:M1", "TEST:M1.STOP", "TEST:M1.DMOV", "TEST:M1.RBV")
+
+    def raising_stop():
+        raise RuntimeError("stop blew up")
+
+    drv.stop = raising_stop
+
+    val.write(20.0, wait=False)
+    time.sleep(0.15)
+    stop.write(1, wait=True, timeout=10)  # STOP raises inside the driver
+
+    # The move was NOT actually stopped (stop() raised before taking
+    # effect), but the record must still be alive: DMOV eventually settles
+    # and RBV keeps being readable.
+    deadline = time.time() + 5
+    while time.time() < deadline and dmov.read().data[0] != 1:
+        time.sleep(0.05)
+    assert dmov.read().data[0] == 1
+
+    # A subsequent valid move must still work end-to-end (loop not dead).
+    val.write(7.0, wait=True, timeout=15)
+    deadline = time.time() + 5
+    while time.time() < deadline and (
+            dmov.read().data[0] != 1
+            or abs(rbv.read().data[0] - 7.0) > 1e-6):
+        time.sleep(0.05)
+    assert dmov.read().data[0] == 1
+    assert abs(rbv.read().data[0] - 7.0) < 1e-6
+    assert abs(drv.getPos() - 7.0) < 1e-6
+
+
 def test_egu_and_velo(motor_ioc):
     h, ctx, drv = motor_ioc
     egu, velo = ctx.get_pvs("TEST:M1.EGU", "TEST:M1.VELO")

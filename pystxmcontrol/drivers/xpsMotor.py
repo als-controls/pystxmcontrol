@@ -195,6 +195,7 @@ class xpsMotor(motor):
             time.sleep(min(line_time, 0.1))
             self.controller.positions[self.group] = \
                 self._to_controller(self._line_stop)
+            self._prepared = False
             return
         if not self._prepared:
             self._cruise_velocity = self.get_velocity()

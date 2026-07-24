@@ -160,13 +160,21 @@ class xpsController(hardwareController):
 
     def abort_move(self, group):
         """David's abort: disable, 1 s, enable, 1 s. (Spec weakness #1:
-        GroupMoveAbort is the candidate improvement -- NOT used yet.)"""
-        self.disable_group(group)
-        time.sleep(1)
-        self.enable_group(group)
-        time.sleep(1)
+        GroupMoveAbort is the candidate improvement -- NOT used yet.)
 
-
-# Make time accessible as a class attribute for monkeypatching in tests
-xpsController.time = time
+        enable_group is ALWAYS attempted, even if disable_group raises (e.g.
+        it misattributes a pending move reply arriving at disable time) --
+        otherwise the servo is stranded disabled. A disable-side XPSError
+        still propagates after the finally so callers see the abort failed.
+        """
+        try:
+            self.disable_group(group)
+        finally:
+            time.sleep(1)
+            try:
+                self.enable_group(group)
+            except XPSError as exc:
+                print(f"[xpsController] enable after abort failed: {exc!r}",
+                      flush=True)
+            time.sleep(1)
 

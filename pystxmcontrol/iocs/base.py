@@ -170,7 +170,16 @@ class MotorRecordGroup(PVGroup):
                 while not move_future.done():
                     if fields.stop.value:
                         if hasattr(self._driver, "stop"):
-                            await loop.run_in_executor(None, self._driver.stop)
+                            try:
+                                await loop.run_in_executor(
+                                    None, self._driver.stop)
+                            except Exception as exc:
+                                # A raising driver.stop() must not kill this
+                                # loop -- otherwise RBV/DMOV freeze forever
+                                # and the whole caproto server goes down.
+                                # Mirrors the move-error guard below.
+                                print(f"{self.prefix}: stop failed: {exc!r}",
+                                      flush=True)
                         await fields.stop.write(0)
                     await async_lib.library.sleep(self._moving_poll)
                 try:

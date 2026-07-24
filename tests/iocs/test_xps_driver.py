@@ -126,6 +126,35 @@ def test_abort_move_is_disable_sleep_enable(monkeypatch):
     assert sleeps == [1, 1]
 
 
+def test_abort_move_enable_still_sent_when_disable_raises(monkeypatch):
+    # F1a: if disable_group raises (e.g. it misattributes a pending move
+    # reply arriving at disable time), enable_group must STILL be sent --
+    # otherwise the servo is stranded disabled. The disable-side error
+    # should still propagate to the caller.
+    from pystxmcontrol.drivers.xpsController import XPSError
+    import importlib
+    mod = importlib.import_module("pystxmcontrol.drivers.xpsController")
+    sleeps = []
+    monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+    ctrl = make_controller(control_replies=["-17,,EndOfAPI", "0,,EndOfAPI"])
+    with pytest.raises(XPSError, match="-17"):
+        ctrl.abort_move("G1")
+    assert ctrl._control.sent == ["GroupMotionDisable(G1)", "GroupMotionEnable(G1)"]
+    assert sleeps == [1, 1]
+
+
+def test_abort_move_enable_failure_is_logged_not_raised(monkeypatch, capsys):
+    # If enable_group ALSO raises after a successful disable, that failure
+    # is logged (not re-raised) so it doesn't mask/replace a real abort.
+    import importlib
+    mod = importlib.import_module("pystxmcontrol.drivers.xpsController")
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    ctrl = make_controller(control_replies=["0,,EndOfAPI", "-22,,EndOfAPI"])
+    ctrl.abort_move("G1")  # must not raise
+    assert ctrl._control.sent == ["GroupMotionDisable(G1)", "GroupMotionEnable(G1)"]
+    assert "enable after abort failed" in capsys.readouterr().out
+
+
 def test_simulation_initialize_opens_no_sockets():
     from pystxmcontrol.drivers.xpsController import xpsController
     ctrl = xpsController(address="10.0.0.1")
@@ -329,3 +358,5 @@ def test_move_line_sim_lands_on_stop():
     m.prepareLine()
     m.moveLine()
     assert m.getPos() == pytest.approx(1.0)
+    # F4: sim path must clear _prepared, matching hardware-path semantics.
+    assert m._prepared is False
