@@ -153,6 +153,29 @@ def test_getline_exception_surfaced(daq_service):
         abort.write(1, wait=True, timeout=15)
 
 
+def test_daq_client_arm_raises_on_busy_rejection(daq_service):
+    """A DaqClient.arm() against a DAQ service that already has a long line
+    armed (by another client, over CA) must raise -- not silently observe the
+    OTHER line's STATUS/INDEX and sail through. Regression test for the hole
+    where STATUS alone (ARMED/ACQUIRING) can't distinguish "my arm succeeded"
+    from "someone else's line is in progress and mine was rejected"."""
+    from pystxmcontrol.iocs.fly_ioc import DaqClient
+
+    harness, ctx = daq_service
+    npts, dwell, arm, abort = _pvs(
+        ctx, "LINE:NPOINTS", "DWELL", "LINE:ARM", "LINE:ABORT")
+    npts.write(200, wait=True)
+    dwell.write(20.0, wait=True)              # long line: ~4 s
+    arm.write(1, wait=True, timeout=15)        # first client's line is armed
+
+    client = DaqClient(PREFIX, ctx)
+    try:
+        with pytest.raises(RuntimeError, match="rejected"):
+            client.arm()
+    finally:
+        abort.write(1, wait=True, timeout=15)
+
+
 def test_busy_guard_prevents_concurrent_arms(daq_service):
     # Verify the _line_starting guard is present and set before awaits
     harness, _ = daq_service

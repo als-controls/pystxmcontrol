@@ -95,6 +95,34 @@ class DaqClient:
         self._write_if_changed("trigger", self._trigger, trigger,
                                data_type=ChannelType.STRING)
 
+    def _read_error(self) -> str:
+        """Decode :LINE:ERROR (CHAR waveform, report_as_string) robustly.
+
+        The "native" read can come back as a plain str (possibly NUL-padded
+        to max_length), a bytes object, or an array of char codes/byte
+        objects (NUL-terminated) depending on caproto version/path -- accept
+        all of them.
+        """
+        err = self._error.read(data_type="native").data
+        if isinstance(err, str):
+            return err.split("\x00", 1)[0]
+        if isinstance(err, bytes):
+            return err.split(b"\x00", 1)[0].decode(errors="replace")
+        chars = []
+        for x in err:
+            if isinstance(x, bytes):
+                if x in (b"", b"\x00"):
+                    break
+                chars.append(x)
+            else:
+                xi = int(x)
+                if xi == 0:
+                    break
+                chars.append(xi)
+        if chars and isinstance(chars[0], bytes):
+            return b"".join(chars).decode(errors="replace")
+        return bytes(chars).decode(errors="replace")
+
     def arm(self):
         self._connect()
         if self._index is None:
@@ -102,14 +130,19 @@ class DaqClient:
         self._armed_from = self._index
         self._index_event.clear()
         self._arm.write(1, wait=True, timeout=10.0)
-        # Fast-fail on contention: a rejected ARM leaves STATUS != ARMED /
-        # ACQUIRING (and an explanation on :LINE:ERROR). Without this check
-        # the caller would only discover the rejection via its line timeout.
+        # Fast-fail on contention: a busy ARM is rejected in-place -- the
+        # service writes the rejection message to :LINE:ERROR BEFORE the put
+        # completes, but leaves STATUS at whatever the OTHER client's line
+        # left it at (which can itself be ARMED/ACQUIRING). So STATUS alone
+        # cannot detect this case: read :LINE:ERROR FIRST, since a successful
+        # arm always clears it to "". Only fall back to the STATUS check
+        # (secondary guard, for the ERROR problems-validation rejection path)
+        # once ERROR is confirmed empty.
+        msg = self._read_error()
+        if msg and "rejected" in msg:
+            raise RuntimeError(f"DAQ {self._prefix} arm rejected: {msg}")
         status = int(self._status.read().data[0])
         if status not in (1, 2):  # ARMED, ACQUIRING
-            err = self._error.read(data_type="native").data
-            msg = (err.decode() if isinstance(err, bytes)
-                   else bytes(int(x) for x in err if int(x)).decode())
             raise RuntimeError(
                 f"DAQ {self._prefix} did not arm (status index {status}): {msg}")
 
