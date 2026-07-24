@@ -55,9 +55,12 @@ def test_plan_fleet_modules(fleet, tmp_path):
     assert len(by_module.get("pystxmcontrol.iocs.motor_ioc", [])) >= 2
     assert len(by_module.get("pystxmcontrol.iocs.daq_ioc", [])) == 1
     assert len(by_module.get("pystxmcontrol.iocs.shutter_ioc", [])) == 1
-    assert len(by_module.get("pystxmcontrol.iocs.derived_ioc", [])) >= 0  # SampleX, SampleY, Energy (env-dependent)
-    # derived plans come last
-    assert all(p.module != "pystxmcontrol.iocs.derived_ioc" for p in plans[:-3])
+    # derived plans (however many this env yields) must come LAST
+    derived = by_module.get("pystxmcontrol.iocs.derived_ioc", [])
+    n = len(derived)
+    non_derived = plans[:len(plans) - n] if n else plans
+    assert all(p.module != "pystxmcontrol.iocs.derived_ioc" for p in non_derived)
+    assert all(p.module == "pystxmcontrol.iocs.derived_ioc" for p in plans[len(plans) - n:]) or n == 0
     for p in plans:
         assert Path(p.slice_path).exists()
 
