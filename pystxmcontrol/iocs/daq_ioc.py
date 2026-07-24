@@ -16,6 +16,15 @@ from pystxmcontrol.iocs.config import read_slice  # noqa: E402
 
 MAX_LINE = 16384
 
+LINE_STATES = ["IDLE", "ARMED", "ACQUIRING", "ERROR"]
+
+
+def _enum_str(prop) -> str:
+    """Enum pvproperty value normalized to its string label (caproto stores
+    either the index or the label depending on version/path)."""
+    v = prop.value
+    return v if isinstance(v, str) else prop.enum_strings[int(v)]
+
 
 class DaqGroup(PVGroup):
     dwell = pvproperty(value=1.0, name=":DWELL", precision=3, doc="dwell per point, ms")
@@ -27,12 +36,28 @@ class DaqGroup(PVGroup):
     counts_wf = pvproperty(value=[0.0], name=":COUNTS:WF", read_only=True,
                            max_length=MAX_LINE)
     rate = pvproperty(value=0.0, name=":RATE", read_only=True, doc="counts/s")
+    line_npoints = pvproperty(value=10, name=":LINE:NPOINTS",
+                              doc="points in the next fly line")
+    line_trigger = pvproperty(value="EXT", enum_strings=["EXT", "IMM", "BUS"],
+                              dtype=ChannelType.ENUM, name=":LINE:TRIGGER")
+    line_arm = pvproperty(value=0, name=":LINE:ARM",
+                          doc="write 1: arm a line; put completes when armed")
+    line_abort = pvproperty(value=0, name=":LINE:ABORT")
+    line_index = pvproperty(value=0, name=":LINE:INDEX", read_only=True,
+                            doc="increments AFTER :COUNTS:WF holds the line")
+    line_status = pvproperty(value="IDLE", enum_strings=list(LINE_STATES),
+                             dtype=ChannelType.ENUM, name=":LINE:STATUS",
+                             read_only=True)
+    line_error = pvproperty(value="", name=":LINE:ERROR", read_only=True,
+                            dtype=ChannelType.CHAR, max_length=256,
+                            report_as_string=True)
 
     def __init__(self, prefix, *, daq, daq_entry, **kwargs):
         super().__init__(prefix, **kwargs)
         self._daq = daq
         self._entry = daq_entry
         self._started = False
+        self._line_task = None
 
     async def _ensure_started(self):
         if not self._started:
@@ -51,9 +76,91 @@ class DaqGroup(PVGroup):
                              f"{instance.enum_strings}")
         return value
 
+    def _line_busy(self) -> bool:
+        return self._line_task is not None and not self._line_task.done()
+
+    @line_arm.putter
+    async def line_arm(self, instance, value):
+        if not value:
+            return 0
+        if self._line_busy():
+            # No-op + error PV. NEVER raise here: the caproto threading
+            # client does not resolve put futures on ErrorResponse, so a
+            # raised rejection would hang the caller until its timeout.
+            await self.line_error.write("ARM rejected: line in progress")
+            return 0
+        n = int(self.line_npoints.value)
+        dwell = float(self.dwell.value)
+        problems = []
+        if not (1 <= n <= MAX_LINE):
+            problems.append(f"NPOINTS {n} outside 1..{MAX_LINE}")
+        if dwell <= 0:
+            problems.append(f"DWELL {dwell} must be > 0")
+        if problems:
+            await self.line_status.write("ERROR")
+            await self.line_error.write("; ".join(problems)[:255])
+            return 0
+        await self._ensure_started()
+        loop = asyncio.get_running_loop()
+        trigger = _enum_str(self.line_trigger)
+        if self._daq.simulation:
+            # sim contract (matches the old in-process fly path): the sim
+            # keysight generates count*samples poisson points after sleeping
+            # dwell*count*samples.
+            cfg = functools.partial(self._daq.config, dwell, count=n, samples=1)
+        else:
+            # hardware line-trigger contract: one trigger event, n samples.
+            cfg = functools.partial(self._daq.config, dwell, count=1,
+                                    samples=n, trigger=trigger)
+        await loop.run_in_executor(None, cfg)
+        if not self._daq.simulation:
+            await loop.run_in_executor(None, self._daq.initLine)
+        await self.line_error.write("")
+        await self.line_status.write("ARMED")
+        # Spawned AFTER arming succeeds; the ARM put's completion is the
+        # client's cue that it may command its motor move.
+        self._line_task = asyncio.create_task(self._acquire_line(n, dwell))
+        return 0
+
+    async def _acquire_line(self, n: int, dwell: float):
+        # Watchdog: a crashed/absent client must not wedge the detector.
+        watchdog = max(5.0, 4.0 * n * dwell / 1000.0 + 5.0)
+        try:
+            await self.line_status.write("ACQUIRING")
+            line = await asyncio.wait_for(self._daq.getLine(), timeout=watchdog)
+        except asyncio.TimeoutError:
+            await self.line_status.write("ERROR")
+            await self.line_error.write(
+                f"line watchdog: no data within {watchdog:.1f}s; auto-disarmed")
+            return
+        except asyncio.CancelledError:
+            await self.line_status.write("IDLE")
+            await self.line_error.write("line aborted")
+            raise
+        # ---- ordering contract: waveform FIRST, then INDEX ----
+        await self.write_line(line)
+        await self.line_index.write(self.line_index.value + 1)
+        await self.line_status.write("IDLE")
+
+    @line_abort.putter
+    async def line_abort(self, instance, value):
+        if value and self._line_busy():
+            self._line_task.cancel()
+            try:
+                await self._line_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - abort is best-effort teardown
+                pass
+            await self.line_status.write("IDLE")
+        return 0
+
     @acquire.putter
     async def acquire(self, instance, value):
         if not value:
+            return 0
+        if self._line_busy():
+            await self.line_error.write("ACQUIRE rejected: line in progress")
             return 0
         await self._ensure_started()
         loop = asyncio.get_running_loop()
