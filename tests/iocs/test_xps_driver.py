@@ -116,7 +116,8 @@ def test_move_relative_surfaces_immediate_error_reply():
 
 
 def test_abort_move_is_disable_sleep_enable(monkeypatch):
-    import pystxmcontrol.drivers.xpsController as mod
+    import importlib
+    mod = importlib.import_module("pystxmcontrol.drivers.xpsController")
     sleeps = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
     ctrl = make_controller(control_replies=["0,,EndOfAPI", "0,,EndOfAPI"])
@@ -181,14 +182,15 @@ def test_move_to_composes_relative_and_polls_to_tolerance():
 
 def test_move_to_timeout_aborts_and_raises(monkeypatch):
     from pystxmcontrol.drivers.xpsController import XPSError
-    import pystxmcontrol.drivers.xpsController as cmod
-    import pystxmcontrol.drivers.xpsMotor as mmod
+    import importlib
+    cmod = importlib.import_module("pystxmcontrol.drivers.xpsController")
+    mmod = importlib.import_module("pystxmcontrol.drivers.xpsMotor")
     monkeypatch.setattr(cmod.time, "sleep", lambda s: None)
     monkeypatch.setattr(mmod.time, "sleep", lambda s: None)
     # position stuck at 0 forever (default reply repeats once queue empties)
     m, ctrl = make_motor(
         entry={"timeout": 0.05},
-        control_replies=["0,,EndOfAPI", "0,,EndOfAPI"])  # disable/enable
+        control_replies=["0,,EndOfAPI", "0,,EndOfAPI", "0,,EndOfAPI"])  # move_relative, disable/enable
     ctrl._monitor.default = "0,0.000000,EndOfAPI"
     with pytest.raises(XPSError, match="timed out"):
         m.moveTo(5.0)
@@ -196,7 +198,8 @@ def test_move_to_timeout_aborts_and_raises(monkeypatch):
 
 
 def test_stop_uses_davids_disable_enable(monkeypatch):
-    import pystxmcontrol.drivers.xpsController as cmod
+    import importlib
+    cmod = importlib.import_module("pystxmcontrol.drivers.xpsController")
     monkeypatch.setattr(cmod.time, "sleep", lambda s: None)
     m, ctrl = make_motor(control_replies=["0,,EndOfAPI", "0,,EndOfAPI"])
     m.stop()
