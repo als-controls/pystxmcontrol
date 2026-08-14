@@ -20,6 +20,45 @@ def motor_ioc(ioc_harness, slow_sim_motor):
     return ioc_harness, ctx, slow_sim_motor
 
 
+def test_val_seeded_from_readback_at_startup(ioc_harness, slow_sim_motor):
+    """At startup .VAL must be synced to the hardware position (real
+    motorRecord init_record() semantics), not left at the pvproperty default
+    of 0.0 -- and that sync must not command a move."""
+    drv = slow_sim_motor
+    drv._controller_position = 12.5
+    drv.controller.positions[drv.group] = 12.5
+
+    moves = []
+    original_move_to = drv.moveTo
+    drv.moveTo = lambda pos: (moves.append(pos), original_move_to(pos))[1]
+
+    group = _make_group(drv)
+    ioc_harness.start(group.pvdb)
+    ctx = ioc_harness.client()
+    val, rbv, dmov = ctx.get_pvs("TEST:M1", "TEST:M1.RBV", "TEST:M1.DMOV",
+                                 timeout=10)
+    val.wait_for_connection(timeout=10)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and val.read().data[0] == 0.0:
+        time.sleep(0.05)
+    assert abs(val.read().data[0] - 12.5) < 1e-6, (
+        "startup .VAL was not seeded from the driver position")
+    assert abs(rbv.read().data[0] - 12.5) < 1e-6
+    # Seeding must be a pure PV update: no move queued, so DMOV never drops
+    # and the axis has not been driven anywhere.
+    assert dmov.read().data[0] == 1
+    assert moves == [], f"startup seeding commanded moves: {moves}"
+    time.sleep(0.3)
+    assert abs(drv.getPos() - 12.5) < 1e-6
+
+    # A subsequent real put still moves (the write hook was installed after
+    # the seed, not skipped).
+    val.write(3.0, wait=True, timeout=15)
+    assert moves == [3.0]
+    assert abs(drv.getPos() - 3.0) < 1e-6
+
+
 def test_move_and_readback(motor_ioc):
     h, ctx, drv = motor_ioc
     val, rbv, dmov = ctx.get_pvs("TEST:M1", "TEST:M1.RBV", "TEST:M1.DMOV")

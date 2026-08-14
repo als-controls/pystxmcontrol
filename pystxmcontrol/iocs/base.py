@@ -112,8 +112,6 @@ class MotorRecordGroup(PVGroup):
             self._move_queue.put_nowait((value, done_event))
             await done_event.wait()
 
-        fields.value_write_hook = value_write_hook
-
         loop = asyncio.get_running_loop()
 
         async def sync_velocity():
@@ -127,6 +125,7 @@ class MotorRecordGroup(PVGroup):
                         lambda: self._driver.setAxisParams(velocity=current))
 
         async def refresh_rbv():
+            """Poll the driver into .RBV; returns True if the read succeeded."""
             try:
                 pos = await loop.run_in_executor(
                     None, self._locked_call, self._driver.getPos)
@@ -140,10 +139,33 @@ class MotorRecordGroup(PVGroup):
                 # loop" guard below.
                 print(f"{self.prefix}: position read failed: {exc!r}",
                       flush=True)
-                return
+                return False
             await fields.user_readback_value.write(pos)
+            return True
 
-        await refresh_rbv()
+        # Sync .VAL to the hardware position at boot, the way a real
+        # motorRecord's init_record() does -- otherwise the setpoint sits at
+        # this pvproperty's declared default (0.0) while the axis is somewhere
+        # else entirely: clients log a bogus setpoint (ophyd's EpicsMotor reads
+        # user_setpoint alongside user_readback, so every pre-move bluesky
+        # document would record 0), a read-VAL/modify/write-VAL tweak commands
+        # a move toward 0, and on an axis whose [minValue, maxValue] excludes 0
+        # the record advertises a .VAL its own limit check would reject.
+        #
+        # Done BEFORE installing value_write_hook so this write cannot queue a
+        # move -- the hook is the only thing that turns a .VAL put into motion,
+        # so seeding first is safe regardless of whether caproto routes
+        # server-side writes through it. If the first read fails, leave .VAL
+        # alone rather than advertising a fabricated 0; the poll loop below
+        # keeps .RBV current, and .VAL is resynced on the next successful
+        # startup. Only .VAL is seeded: this record never maintains the dial
+        # fields (the driver applies offset/units itself and the record has no
+        # .OFF/.DIR notion), so writing DRBV/DVAL here would invent a
+        # convention the rest of the record doesn't honor.
+        if await refresh_rbv():
+            await instance.write(fields.user_readback_value.value)
+
+        fields.value_write_hook = value_write_hook
 
         while True:
             await sync_velocity()
